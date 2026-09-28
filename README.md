@@ -98,3 +98,7 @@ A failing seed prints the command that replays it exactly.
 - Tables are loaded fully into memory; reading blocks from disk is milestone 2.
 - The simulator models power loss and torn writes. It does not yet model
   disks that lie about syncs, or silent corruption of already-synced data.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

@@ -2,5 +2,8 @@
 name = "quorumdb"
 version = "0.1.0"
 edition = "2024"
+description = "A distributed SQL database, built one proven layer at a time"
+license = "Apache-2.0"
+repository = "https://github.com/Shakhtar-Sankur/quorumdb"
 
 [dependencies]
