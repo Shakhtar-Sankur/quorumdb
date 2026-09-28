@@ -63,10 +63,7 @@ pub fn decode_all(data: &[u8]) -> (Vec<Record>, usize) {
     let mut records = Vec::new();
     let mut valid = 0;
     let mut r = Reader::new(data);
-    loop {
-        let (Some(len), Some(crc)) = (r.u32(), r.u32()) else {
-            break;
-        };
+    while let (Some(len), Some(crc)) = (r.u32(), r.u32()) {
         let len = len as usize;
         if len > MAX_RECORD {
             break;
