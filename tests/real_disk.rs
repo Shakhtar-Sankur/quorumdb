@@ -14,7 +14,11 @@ fn survives_reopen_with_flushes_and_compaction() {
     let opts = Options {
         sync: SyncMode::Manual,
         memtable_bytes: 2048,
-        compact_at: 3,
+        block_bytes: 256,
+        table_bytes: 4096,
+        l0_compact_at: 3,
+        level1_bytes: 8192,
+        level_multiplier: 4,
         ..Options::default()
     };
     {
@@ -32,13 +36,27 @@ fn survives_reopen_with_flushes_and_compaction() {
         }
         db.sync().unwrap();
         assert!(db.stats().flushes > 0 && db.stats().compactions > 0);
+        assert!(
+            db.max_level() >= 2,
+            "expected several levels, got {}",
+            db.max_level()
+        );
     }
     let expected: Vec<_> = {
         let db = Db::open(RealFs::open(&dir).unwrap(), opts.clone()).unwrap();
-        db.scan()
+        db.scan().unwrap()
     };
-    let db = Db::open(RealFs::open(&dir).unwrap(), opts).unwrap();
-    assert_eq!(db.scan(), expected);
-    assert_eq!(db.get(b"key00699").as_deref(), Some(&b"value-1399"[..]));
+    let mut db = Db::open(RealFs::open(&dir).unwrap(), opts).unwrap();
+    assert_eq!(db.scan().unwrap(), expected);
+    assert_eq!(
+        db.get(b"key00699").unwrap().as_deref(),
+        Some(&b"value-1399"[..])
+    );
+    for (k, v) in &expected {
+        assert_eq!(db.get(k).unwrap().as_ref(), Some(v));
+    }
+    db.compact().unwrap();
+    assert_eq!(db.scan().unwrap(), expected);
+    assert!(db.stats().tombstones_dropped > 0);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -19,6 +19,15 @@ fn no_durable_write_is_ever_lost() {
 }
 
 #[test]
+fn compaction_reaches_deep_levels() {
+    let deepest = (0..50)
+        .map(|seed| sim::run(seed, 1500, Fault::None).unwrap().max_level)
+        .max()
+        .unwrap();
+    assert!(deepest >= 3, "the simulator only reached level {deepest}");
+}
+
+#[test]
 fn the_same_seed_replays_identically() {
     let a = sim::run(42, 1500, Fault::None).unwrap();
     let b = sim::run(42, 1500, Fault::None).unwrap();
@@ -33,6 +42,7 @@ fn every_planted_bug_is_caught() {
         Fault::SkipWalTruncate,
         Fault::SkipDirSync,
         Fault::NoSyncBeforeManifest,
+        Fault::DropTombstonesEarly,
     ] {
         let caught =
             (0..500).find_map(|seed| sim::run(seed, 1500, fault).err().map(|msg| (seed, msg)));

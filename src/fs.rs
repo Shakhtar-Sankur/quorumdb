@@ -23,6 +23,10 @@ use crate::rng::Rng;
 pub trait Fs {
     /// The whole file, or `None` if it does not exist.
     fn read(&self, name: &str) -> io::Result<Option<Vec<u8>>>;
+    /// Exactly `len` bytes starting at `offset`.
+    fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>>;
+    /// The current length of `name` in bytes.
+    fn size(&self, name: &str) -> io::Result<u64>;
     /// Create or truncate `name` and write `data`. Not durable until `sync`.
     fn write_new(&self, name: &str, data: &[u8]) -> io::Result<()>;
     /// Append to `name`, creating it if needed. Not durable until `sync`.
@@ -48,6 +52,7 @@ fn not_found(name: &str) -> io::Error {
 pub struct RealFs {
     dir: PathBuf,
     handles: RefCell<HashMap<String, File>>,
+    readers: RefCell<HashMap<String, File>>,
 }
 
 impl RealFs {
@@ -57,12 +62,37 @@ impl RealFs {
         Ok(RealFs {
             dir,
             handles: RefCell::new(HashMap::new()),
+            readers: RefCell::new(HashMap::new()),
         })
     }
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
+
+    fn forget(&self, name: &str) {
+        self.handles.borrow_mut().remove(name);
+        self.readers.borrow_mut().remove(name);
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0;
+    while done < buf.len() {
+        match file.seek_read(&mut buf[done..], offset + done as u64)? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            n => done += n,
+        }
+    }
+    Ok(())
 }
 
 impl Fs for RealFs {
@@ -74,7 +104,22 @@ impl Fs for RealFs {
         }
     }
 
+    fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let mut readers = self.readers.borrow_mut();
+        if !readers.contains_key(name) {
+            readers.insert(name.to_string(), File::open(self.path(name))?);
+        }
+        let mut buf = vec![0; len];
+        read_exact_at(&readers[name], &mut buf, offset)?;
+        Ok(buf)
+    }
+
+    fn size(&self, name: &str) -> io::Result<u64> {
+        Ok(fs::metadata(self.path(name))?.len())
+    }
+
     fn write_new(&self, name: &str, data: &[u8]) -> io::Result<()> {
+        self.readers.borrow_mut().remove(name);
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -103,12 +148,16 @@ impl Fs for RealFs {
     fn sync(&self, name: &str) -> io::Result<()> {
         match self.handles.borrow().get(name) {
             Some(file) => file.sync_data(),
-            None => File::open(self.path(name))?.sync_data(),
+            // Opened for writing: Windows refuses to flush a read-only handle.
+            None => OpenOptions::new()
+                .write(true)
+                .open(self.path(name))?
+                .sync_data(),
         }
     }
 
     fn truncate(&self, name: &str, len: u64) -> io::Result<()> {
-        self.handles.borrow_mut().remove(name);
+        self.forget(name);
         OpenOptions::new()
             .write(true)
             .open(self.path(name))?
@@ -116,14 +165,13 @@ impl Fs for RealFs {
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        let mut handles = self.handles.borrow_mut();
-        handles.remove(from);
-        handles.remove(to);
+        self.forget(from);
+        self.forget(to);
         fs::rename(self.path(from), self.path(to))
     }
 
     fn remove(&self, name: &str) -> io::Result<()> {
-        self.handles.borrow_mut().remove(name);
+        self.forget(name);
         match fs::remove_file(self.path(name)) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             other => other,
@@ -141,8 +189,16 @@ impl Fs for RealFs {
         Ok(names)
     }
 
+    #[cfg(unix)]
     fn sync_dir(&self) -> io::Result<()> {
         File::open(&self.dir)?.sync_all()
+    }
+
+    /// Windows cannot open a directory as a file to sync it; NTFS journals
+    /// its metadata, making a completed rename durable on its own.
+    #[cfg(not(unix))]
+    fn sync_dir(&self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -253,6 +309,21 @@ impl Fs for SimFs {
     fn read(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
         let st = self.0.borrow();
         Ok(st.names.get(name).map(|ino| st.inodes[ino].current.clone()))
+    }
+
+    fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.with_inode(name, |inode| {
+            let start = offset as usize;
+            inode
+                .current
+                .get(start..start.saturating_add(len))
+                .map(<[u8]>::to_vec)
+        })?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, name.to_string()))
+    }
+
+    fn size(&self, name: &str) -> io::Result<u64> {
+        self.with_inode(name, |inode| inode.current.len() as u64)
     }
 
     fn write_new(&self, name: &str, data: &[u8]) -> io::Result<()> {

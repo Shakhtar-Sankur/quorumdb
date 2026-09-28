@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::engine::{Db, Fault, Options, SyncMode};
+use crate::engine::{Db, Fault, Options, Stats, SyncMode};
 use crate::fs::SimFs;
 use crate::rng::Rng;
 use crate::wal::Op;
@@ -28,7 +28,20 @@ pub struct Report {
     pub torn_writes: u64,
     pub flushes: u64,
     pub compactions: u64,
+    pub trivial_moves: u64,
+    pub tombstones_dropped: u64,
     pub lost_unsynced: u64,
+    /// The deepest level any table reached during the run.
+    pub max_level: usize,
+}
+
+impl Report {
+    fn add_stats(&mut self, stats: Stats) {
+        self.flushes += stats.flushes;
+        self.compactions += stats.compactions;
+        self.trivial_moves += stats.trivial_moves;
+        self.tombstones_dropped += stats.tombstones_dropped;
+    }
 }
 
 fn apply(model: &mut Model, op: &Op) {
@@ -52,8 +65,15 @@ pub fn run(seed: u64, steps: usize, fault: Fault) -> Result<Report, String> {
         } else {
             SyncMode::Manual
         },
+        // Tiny sizes, so a short run exercises many blocks per table, many
+        // tables per level, and several levels.
         memtable_bytes: 64 + rng.below(1024) as usize,
-        compact_at: 2 + rng.below(5) as usize,
+        block_bytes: 16 + rng.below(256) as usize,
+        table_bytes: 64 + rng.below(1024) as usize,
+        l0_compact_at: 2 + rng.below(4) as usize,
+        level1_bytes: 128 + rng.below(1024),
+        level_multiplier: 2 + rng.below(3),
+        bloom_bits_per_key: rng.below(13) as usize,
         fault,
     };
     let fail =
@@ -71,9 +91,7 @@ pub fn run(seed: u64, steps: usize, fault: Fault) -> Result<Report, String> {
         steps,
         ..Report::default()
     };
-    let (mut flushes, mut compactions) = (0, 0);
-
-    let key_space = 8 + rng.below(56);
+    let key_space = 8 + rng.below(248);
     for step in 1..=steps {
         let roll = rng.below(100);
         if roll < 70 {
@@ -101,20 +119,27 @@ pub fn run(seed: u64, steps: usize, fault: Fault) -> Result<Report, String> {
                 .map_err(|e| fail(step, format!("sync failed: {e}")))?;
             durable = current.clone();
             pending.clear();
-        } else if roll < 79 {
+        } else if roll < 78 {
             db.flush()
                 .map_err(|e| fail(step, format!("flush failed: {e}")))?;
             durable = current.clone();
             pending.clear();
+        } else if roll < 79 {
+            // A full compaction writes nothing to the log, so it changes
+            // neither what is durable nor what is pending.
+            db.compact()
+                .map_err(|e| fail(step, format!("compaction failed: {e}")))?;
         } else if roll < 83 {
-            let stats = db.stats();
-            flushes += stats.flushes;
-            compactions += stats.compactions;
+            report.add_stats(db.stats());
             drop(db);
             fs.crash();
             db = Db::open(fs.clone(), opts.clone())
                 .map_err(|e| fail(step, format!("recovery failed: {e}")))?;
-            let recovered: Model = db.scan().into_iter().collect();
+            let recovered: Model = db
+                .scan()
+                .map_err(|e| fail(step, format!("scan after recovery failed: {e}")))?
+                .into_iter()
+                .collect();
 
             // Find the prefix of pending writes the recovered state matches.
             let mut state = durable.clone();
@@ -126,22 +151,35 @@ pub fn run(seed: u64, steps: usize, fault: Fault) -> Result<Report, String> {
                 matched = state == recovered;
             }
             if !matched {
-                let lost: Vec<_> = durable
-                    .keys()
-                    .filter(|k| !recovered.contains_key(*k))
-                    .take(5)
-                    .collect();
+                let names = |keys: Vec<&Vec<u8>>| {
+                    keys.into_iter()
+                        .take(5)
+                        .map(|k| String::from_utf8_lossy(k).into_owned())
+                        .collect::<Vec<_>>()
+                };
+                let missing = names(
+                    durable
+                        .keys()
+                        .filter(|k| !recovered.contains_key(*k))
+                        .collect(),
+                );
+                // Present after recovery, yet deleted (or never written) both
+                // at the durable point and after every acknowledged write.
+                let resurrected = names(
+                    recovered
+                        .keys()
+                        .filter(|k| !durable.contains_key(*k) && !current.contains_key(*k))
+                        .collect(),
+                );
                 return Err(fail(
                     step,
                     format!(
                         "recovered state matches no prefix of the {} acknowledged writes since the durable point \
-                         ({} keys durable, {} recovered; durable keys missing: {:?})",
+                         ({} keys durable, {} recovered; durable keys missing: {missing:?}; \
+                         deleted keys back from the dead: {resurrected:?})",
                         pending.len(),
                         durable.len(),
                         recovered.len(),
-                        lost.iter()
-                            .map(|k| String::from_utf8_lossy(k))
-                            .collect::<Vec<_>>()
                     ),
                 ));
             }
@@ -151,7 +189,9 @@ pub fn run(seed: u64, steps: usize, fault: Fault) -> Result<Report, String> {
             pending.clear();
         } else {
             let key = format!("k{:03}", rng.below(key_space)).into_bytes();
-            let got = db.get(&key);
+            let got = db
+                .get(&key)
+                .map_err(|e| fail(step, format!("get failed: {e}")))?;
             if got.as_ref() != current.get(&key) {
                 return Err(fail(
                     step,
@@ -163,15 +203,18 @@ pub fn run(seed: u64, steps: usize, fault: Fault) -> Result<Report, String> {
                 ));
             }
         }
+        report.max_level = report.max_level.max(db.max_level());
     }
 
-    let final_state: Model = db.scan().into_iter().collect();
+    let final_state: Model = db
+        .scan()
+        .map_err(|e| fail(steps, format!("final scan failed: {e}")))?
+        .into_iter()
+        .collect();
     if final_state != current {
         return Err(fail(steps, "final scan differs from the model".to_string()));
     }
-    let stats = db.stats();
-    report.flushes = flushes + stats.flushes;
-    report.compactions = compactions + stats.compactions;
+    report.add_stats(db.stats());
     report.crashes = fs.crashes();
     report.torn_writes = fs.torn_writes();
     Ok(report)

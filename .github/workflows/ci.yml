@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+      # Debug build: overflow checks and debug assertions (such as the
+      # no-overlap check after every compaction) are on.
+      - run: cargo test
+        env:
+          QDB_SEEDS: "100"
+
+  simulate:
+    name: crash simulation, 2000 seeds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: ./target/release/quorumdb sim --seeds 2000 --steps 2000
+      - name: every planted bug is caught
+        run: |
+          for fault in skip-wal-truncate skip-dir-sync no-sync-before-manifest drop-tombstones-early; do
+            if ./target/release/quorumdb sim --seeds 500 --fault "$fault"; then
+              echo "planted bug $fault was not caught" >&2
+              exit 1
+            fi
+          done
+
+  bench:
+    name: benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: ./target/release/quorumdb bench "$RUNNER_TEMP/bench" | tee -a "$GITHUB_STEP_SUMMARY"
