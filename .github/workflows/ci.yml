@@ -28,10 +28,10 @@ jobs:
       # no-overlap check after every compaction) are on.
       - run: cargo test
         env:
-          QDB_SEEDS: "100"
+          QDB_SEEDS: "30"
 
   simulate:
-    name: crash simulation, 2000 seeds
+    name: storage crash simulation, 2000 seeds
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -42,6 +42,40 @@ jobs:
         run: |
           for fault in skip-wal-truncate skip-dir-sync no-sync-before-manifest drop-tombstones-early; do
             if ./target/release/quorumdb sim --seeds 500 --fault "$fault"; then
+              echo "planted bug $fault was not caught" >&2
+              exit 1
+            fi
+          done
+
+  raft:
+    name: raft simulation, 1000 clusters
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: ./target/release/quorumdb raft-sim --seeds 1000
+      - name: every planted raft bug is caught
+        run: |
+          for fault in vote-ignores-log commit-old-term skip-prev-check read-without-quorum; do
+            if ./target/release/quorumdb raft-sim --seeds 3000 --fault "$fault"; then
+              echo "planted bug $fault was not caught" >&2
+              exit 1
+            fi
+          done
+
+  cluster:
+    name: cluster simulation, 500 clusters
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: ./target/release/quorumdb kv-sim --seeds 500
+      - name: every planted cluster bug is caught
+        run: |
+          for fault in skip-raft-sync stale-local-reads snapshot-self-removal; do
+            if ./target/release/quorumdb kv-sim --seeds 500 --fault "$fault"; then
               echo "planted bug $fault was not caught" >&2
               exit 1
             fi

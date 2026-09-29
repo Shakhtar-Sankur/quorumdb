@@ -11,16 +11,26 @@ usage:
   quorumdb shell <dir>                       interactive shell on a real directory
   quorumdb sim [--seeds N] [--steps N] [--from S] [--fault NAME]
                                              run the crash simulator
+  quorumdb raft-sim [--seeds N] [--ms N] [--from S] [--fault NAME]
+                                             run the Raft cluster simulator
+  quorumdb kv-sim [--seeds N] [--ms N] [--from S] [--fault NAME]
+                                             run the multi-Raft cluster simulator
   quorumdb bench <empty dir> [--keys N] [--value-bytes N] [--reads N]
                                              benchmark on a real directory
-faults (to prove the simulator catches them):
-  skip-wal-truncate | skip-dir-sync | no-sync-before-manifest | drop-tombstones-early";
+storage faults (to prove the simulator catches them):
+  skip-wal-truncate | skip-dir-sync | no-sync-before-manifest | drop-tombstones-early
+raft faults:
+  vote-ignores-log | commit-old-term | skip-prev-check | read-without-quorum
+cluster faults:
+  skip-raft-sync | stale-local-reads | snapshot-self-removal";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("shell") if args.len() == 2 => shell(&args[1]),
         Some("sim") => simulate(&args[1..]),
+        Some("raft-sim") => raft_simulate(&args[1..]),
+        Some("kv-sim") => kv_simulate(&args[1..]),
         Some("bench") if args.len() >= 2 => bench(&args[1], &args[2..]),
         _ => Err(USAGE.to_string()),
     };
@@ -340,5 +350,136 @@ fn bench(dir: &str, args: &[String]) -> Result<(), String> {
         stats.trivial_moves
     );
     println!("{}", levels(&db));
+    Ok(())
+}
+
+fn raft_simulate(args: &[String]) -> Result<(), String> {
+    use quorumdb::raft::{RaftFault, sim as rsim};
+    let (mut seeds, mut ms, mut from, mut fault_name) =
+        (100u64, 10_000u64, 0u64, "none".to_string());
+    parse_flags(args, |flag, value| {
+        match flag {
+            "--seeds" => seeds = num(flag, value)?,
+            "--ms" => ms = num(flag, value)?,
+            "--from" => from = num(flag, value)?,
+            "--fault" => fault_name = value.to_string(),
+            other => return Err(format!("unknown flag: {other}\n{USAGE}")),
+        }
+        Ok(())
+    })?;
+    let fault = match fault_name.as_str() {
+        "none" => RaftFault::None,
+        "vote-ignores-log" => RaftFault::VoteIgnoresLog,
+        "commit-old-term" => RaftFault::CommitOldTerm,
+        "skip-prev-check" => RaftFault::SkipPrevCheck,
+        "read-without-quorum" => RaftFault::ReadWithoutQuorum,
+        other => return Err(format!("unknown fault: {other}\n{USAGE}")),
+    };
+    let start = Instant::now();
+    let mut t = rsim::Report::default();
+    for seed in from..from + seeds {
+        match rsim::run(seed, ms, fault) {
+            Ok(r) => {
+                t.messages += r.messages;
+                t.dropped += r.dropped;
+                t.crashes += r.crashes;
+                t.partitions += r.partitions;
+                t.elections += r.elections;
+                t.acked_writes += r.acked_writes;
+                t.reads += r.reads;
+                t.snapshots += r.snapshots;
+                t.config_changes += r.config_changes;
+                t.transfers += r.transfers;
+            }
+            Err(msg) => {
+                return Err(format!(
+                    "FAILED {msg}\nreplay: quorumdb raft-sim --from {seed} --seeds 1 --ms {ms} --fault {fault_name}"
+                ));
+            }
+        }
+    }
+    println!(
+        "ok: {seeds} clusters x {:.0}s simulated in {:.1}s\n  {} messages ({} lost), {} crashes, {} partitions, {} leaders elected\n  \
+         {} membership changes, {} leadership transfers, {} snapshots installed\n  \
+         {} writes acknowledged, {} linearizable reads, 0 safety violations",
+        ms as f64 / 1000.0,
+        start.elapsed().as_secs_f64(),
+        t.messages,
+        t.dropped,
+        t.crashes,
+        t.partitions,
+        t.elections,
+        t.config_changes,
+        t.transfers,
+        t.snapshots,
+        t.acked_writes,
+        t.reads
+    );
+    Ok(())
+}
+
+fn kv_simulate(args: &[String]) -> Result<(), String> {
+    use quorumdb::kv::sim as ksim;
+    use quorumdb::kv::store::StoreFault;
+    let (mut seeds, mut ms, mut from, mut fault_name) =
+        (20u64, 10_000u64, 0u64, "none".to_string());
+    parse_flags(args, |flag, value| {
+        match flag {
+            "--seeds" => seeds = num(flag, value)?,
+            "--ms" => ms = num(flag, value)?,
+            "--from" => from = num(flag, value)?,
+            "--fault" => fault_name = value.to_string(),
+            other => return Err(format!("unknown flag: {other}\n{USAGE}")),
+        }
+        Ok(())
+    })?;
+    let fault = match fault_name.as_str() {
+        "none" => StoreFault::None,
+        "skip-raft-sync" => StoreFault::SkipRaftSync,
+        "stale-local-reads" => StoreFault::StaleLocalReads,
+        "snapshot-self-removal" => StoreFault::SnapshotSelfRemoval,
+        other => return Err(format!("unknown fault: {other}\n{USAGE}")),
+    };
+    let start = Instant::now();
+    let mut t = ksim::Report::default();
+    for seed in from..from + seeds {
+        match ksim::run(seed, ms, fault) {
+            Ok(r) => {
+                t.ops += r.ops;
+                t.writes += r.writes;
+                t.reads += r.reads;
+                t.unknown += r.unknown;
+                t.crashes += r.crashes;
+                t.partitions += r.partitions;
+                t.messages += r.messages;
+                t.dropped += r.dropped;
+                t.ranges += r.ranges;
+                t.replica_moves += r.replica_moves;
+                t.keys_checked += r.keys_checked;
+            }
+            Err(msg) => {
+                return Err(format!(
+                    "FAILED {msg}\nreplay: quorumdb kv-sim --from {seed} --seeds 1 --ms {ms} --fault {fault_name}"
+                ));
+            }
+        }
+    }
+    println!(
+        "ok: {seeds} clusters x {:.0}s simulated in {:.1}s\n  {} messages ({} lost), {} crashes, {} partitions\n  \
+         {} ranges after splits, {} replica moves\n  \
+         {} writes, {} reads, {} with unknown outcome; {} key histories linearizable",
+        ms as f64 / 1000.0,
+        start.elapsed().as_secs_f64(),
+        t.messages,
+        t.dropped,
+        t.crashes,
+        t.partitions,
+        t.ranges,
+        t.replica_moves,
+        t.writes,
+        t.reads,
+        t.unknown,
+        t.keys_checked
+    );
     Ok(())
 }

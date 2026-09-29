@@ -12,10 +12,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::engine::{Db, Fault, Options, Stats, SyncMode};
-use crate::fs::SimFs;
 use crate::rng::Rng;
-use crate::wal::Op;
+use crate::storage::engine::{Db, Fault, Options, Stats, SyncMode};
+use crate::storage::fs::SimFs;
+use crate::storage::wal::Op;
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -44,13 +44,15 @@ impl Report {
     }
 }
 
-fn apply(model: &mut Model, op: &Op) {
-    match op {
-        Op::Put(k, v) => {
-            model.insert(k.clone(), v.clone());
-        }
-        Op::Delete(k) => {
-            model.remove(k);
+fn apply(model: &mut Model, batch: &[Op]) {
+    for op in batch {
+        match op {
+            Op::Put(k, v) => {
+                model.insert(k.clone(), v.clone());
+            }
+            Op::Delete(k) => {
+                model.remove(k);
+            }
         }
     }
 }
@@ -84,7 +86,7 @@ pub fn run(seed: u64, steps: usize, fault: Fault) -> Result<Report, String> {
     // `durable` is the model at the last point the engine promised
     // durability; `pending` holds the acknowledged writes since then.
     let mut durable = Model::new();
-    let mut pending: Vec<Op> = Vec::new();
+    let mut pending: Vec<Vec<Op>> = Vec::new();
     let mut current = Model::new();
     let mut report = Report {
         seed,
@@ -95,20 +97,27 @@ pub fn run(seed: u64, steps: usize, fault: Fault) -> Result<Report, String> {
     for step in 1..=steps {
         let roll = rng.below(100);
         if roll < 70 {
-            let key = format!("k{:03}", rng.below(key_space)).into_bytes();
-            let op = if roll < 55 {
-                let len = rng.below(24) as usize;
-                Op::Put(key, rng.bytes(len))
-            } else {
-                Op::Delete(key)
-            };
-            let result = match &op {
-                Op::Put(k, v) => db.put(k, v),
-                Op::Delete(k) => db.delete(k),
+            // Mostly single writes; sometimes an atomic batch of several.
+            let size = if rng.chance(20) { 2 + rng.below(4) } else { 1 };
+            let batch: Vec<Op> = (0..size)
+                .map(|_| {
+                    let key = format!("k{:03}", rng.below(key_space)).into_bytes();
+                    if rng.below(70) < 55 {
+                        let len = rng.below(24) as usize;
+                        Op::Put(key, rng.bytes(len))
+                    } else {
+                        Op::Delete(key)
+                    }
+                })
+                .collect();
+            let result = match batch.as_slice() {
+                [Op::Put(k, v)] => db.put(k, v),
+                [Op::Delete(k)] => db.delete(k),
+                _ => db.write_batch(batch.clone()),
             };
             result.map_err(|e| fail(step, format!("write failed: {e}")))?;
-            apply(&mut current, &op);
-            pending.push(op);
+            apply(&mut current, &batch);
+            pending.push(batch);
             report.writes += 1;
             if opts.sync == SyncMode::Always {
                 durable = current.clone();
@@ -187,6 +196,31 @@ pub fn run(seed: u64, steps: usize, fault: Fault) -> Result<Report, String> {
             durable = state;
             current = durable.clone();
             pending.clear();
+        } else if roll < 90 {
+            // A range scan over a random span must match the model exactly.
+            let a = format!("k{:03}", rng.below(key_space + 1)).into_bytes();
+            let b = format!("k{:03}", rng.below(key_space + 1)).into_bytes();
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let got: Vec<(Vec<u8>, Vec<u8>)> = db
+                .range(&lo, Some(&hi))
+                .collect::<crate::Result<_>>()
+                .map_err(|e| fail(step, format!("range scan failed: {e}")))?;
+            let want: Vec<(Vec<u8>, Vec<u8>)> = current
+                .range(lo.clone()..hi.clone())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if got != want {
+                return Err(fail(
+                    step,
+                    format!(
+                        "range [{}, {}) returned {} rows, expected {}",
+                        String::from_utf8_lossy(&lo),
+                        String::from_utf8_lossy(&hi),
+                        got.len(),
+                        want.len()
+                    ),
+                ));
+            }
         } else {
             let key = format!("k{:03}", rng.below(key_space)).into_bytes();
             let got = db

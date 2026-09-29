@@ -2,7 +2,11 @@
 //! acknowledged, so the memtable can always be rebuilt after a crash.
 //!
 //! Record: `[len: u32][crc32(payload): u32][payload]`
-//! Payload: `[seq: u64][kind: u8][key][value if put]`, byte strings length-prefixed.
+//! Payload: `[seq: u64][n: u32]` then n x `[kind: u8][key][value if put]`,
+//! byte strings length-prefixed.
+//!
+//! A record is one atomic batch: after a crash either every operation in it
+//! is recovered or none is.
 //!
 //! Decoding stops at the first record that is short, oversized, or fails its
 //! checksum: that is the torn tail of the last write before a crash.
@@ -23,21 +27,24 @@ pub enum Op {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub seq: u64,
-    pub op: Op,
+    pub ops: Vec<Op>,
 }
 
 pub fn encode(rec: &Record) -> Vec<u8> {
     let mut payload = Vec::new();
     put_u64(&mut payload, rec.seq);
-    match &rec.op {
-        Op::Put(k, v) => {
-            payload.push(KIND_PUT);
-            put_bytes(&mut payload, k);
-            put_bytes(&mut payload, v);
-        }
-        Op::Delete(k) => {
-            payload.push(KIND_DELETE);
-            put_bytes(&mut payload, k);
+    put_u32(&mut payload, rec.ops.len() as u32);
+    for op in &rec.ops {
+        match op {
+            Op::Put(k, v) => {
+                payload.push(KIND_PUT);
+                put_bytes(&mut payload, k);
+                put_bytes(&mut payload, v);
+            }
+            Op::Delete(k) => {
+                payload.push(KIND_DELETE);
+                put_bytes(&mut payload, k);
+            }
         }
     }
     let mut out = Vec::with_capacity(payload.len() + 8);
@@ -50,12 +57,16 @@ pub fn encode(rec: &Record) -> Vec<u8> {
 fn decode_payload(payload: &[u8]) -> Option<Record> {
     let mut r = Reader::new(payload);
     let seq = r.u64()?;
-    let op = match r.u8()? {
-        KIND_PUT => Op::Put(r.bytes()?, r.bytes()?),
-        KIND_DELETE => Op::Delete(r.bytes()?),
-        _ => return None,
-    };
-    r.is_empty().then_some(Record { seq, op })
+    let n = r.u32()?;
+    let mut ops = Vec::with_capacity(n.min(1 << 16) as usize);
+    for _ in 0..n {
+        ops.push(match r.u8()? {
+            KIND_PUT => Op::Put(r.bytes()?, r.bytes()?),
+            KIND_DELETE => Op::Delete(r.bytes()?),
+            _ => return None,
+        });
+    }
+    r.is_empty().then_some(Record { seq, ops })
 }
 
 /// Every intact record, and the length of the valid prefix they occupy.
@@ -89,15 +100,18 @@ mod tests {
         vec![
             Record {
                 seq: 1,
-                op: Op::Put(b"a".to_vec(), b"1".to_vec()),
+                ops: vec![Op::Put(b"a".to_vec(), b"1".to_vec())],
             },
             Record {
                 seq: 2,
-                op: Op::Delete(b"a".to_vec()),
+                ops: vec![
+                    Op::Delete(b"a".to_vec()),
+                    Op::Put(b"c".to_vec(), b"3".to_vec()),
+                ],
             },
             Record {
                 seq: 3,
-                op: Op::Put(b"b".to_vec(), Vec::new()),
+                ops: vec![Op::Put(b"b".to_vec(), Vec::new())],
             },
         ]
     }

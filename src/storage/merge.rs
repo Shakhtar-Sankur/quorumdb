@@ -9,7 +9,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::error::Result;
-use crate::sstable::Entry;
+use crate::storage::sstable::Entry;
 
 pub type Source<'a> = Box<dyn Iterator<Item = Result<Entry>> + 'a>;
 

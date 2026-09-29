@@ -1,22 +1,21 @@
 //! quorumdb: a distributed SQL database, built one proven layer at a time.
 //!
-//! Milestones 1 and 2 are the single-node storage engine (a write-ahead
-//! log, block-indexed tables with bloom filters, leveled compaction) and the
-//! deterministic simulator that tests it. See the README for the roadmap.
+//! - [`storage`]: the single-node LSM storage engine and its crash simulator.
+//! - [`raft`]: Raft consensus as a pure state machine, and its cluster simulator.
+//!
+//! See the README for the architecture and the roadmap.
 
-pub mod bloom;
+pub mod check;
 pub mod codec;
 pub mod crc;
-pub mod engine;
 pub mod error;
-pub mod fs;
-pub mod manifest;
-pub mod merge;
+pub mod kv;
+pub mod raft;
 pub mod rng;
-pub mod sim;
-pub mod sstable;
-pub mod wal;
+pub mod storage;
 
-pub use engine::{Db, Options, Stats, SyncMode};
 pub use error::{Error, Result};
-pub use fs::{Fs, RealFs, SimFs};
+pub use storage::engine::{self, Db, Options, Stats, SyncMode};
+pub use storage::fs::{self, Fs, RealFs, SimFs};
+pub use storage::sim;
+pub use storage::wal::Op;

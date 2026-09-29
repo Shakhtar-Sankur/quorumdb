@@ -25,11 +25,11 @@ use std::collections::BTreeMap;
 use std::io;
 
 use crate::error::{Error, Result};
-use crate::fs::Fs;
-use crate::manifest::{self, Manifest};
-use crate::merge::{MergeIter, Source};
-use crate::sstable::{Table, TableBuilder};
-use crate::wal::{self, Op, Record};
+use crate::storage::fs::Fs;
+use crate::storage::manifest::{self, Manifest};
+use crate::storage::merge::{MergeIter, Source};
+use crate::storage::sstable::{Table, TableBuilder};
+use crate::storage::wal::{self, Op, Record};
 
 const MANIFEST: &str = "MANIFEST";
 const MANIFEST_TMP: &str = "MANIFEST.tmp";
@@ -201,11 +201,20 @@ impl<F: Fs> Db<F> {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.write(Op::Put(key.to_vec(), value.to_vec()))
+        self.write(vec![Op::Put(key.to_vec(), value.to_vec())])
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.write(Op::Delete(key.to_vec()))
+        self.write(vec![Op::Delete(key.to_vec())])
+    }
+
+    /// Apply several writes atomically: after a crash either all of them are
+    /// recovered or none is. Later operations on the same key win.
+    pub fn write_batch(&mut self, ops: Vec<Op>) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.write(ops)
     }
 
     /// Newest first: the memtable, level 0 newest to oldest, then at most one
@@ -244,20 +253,45 @@ impl<F: Fs> Db<F> {
 
     /// Every live key and value in key order, streamed a block at a time.
     pub fn iter(&self) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
+        self.range(&[], None)
+    }
+
+    /// Live keys in `[start, end)` in key order (no upper bound if `end` is
+    /// `None`), streamed a block at a time. Tables that end before `start`
+    /// are never read.
+    pub fn range<'a>(
+        &'a self,
+        start: &'a [u8],
+        end: Option<&'a [u8]>,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a {
         let mut sources: Vec<Source<'_>> = vec![Box::new(
-            self.mem.iter().map(|(k, v)| Ok((k.clone(), v.clone()))),
+            self.mem
+                .range::<[u8], _>((std::ops::Bound::Included(start), std::ops::Bound::Unbounded))
+                .map(|(k, v)| Ok((k.clone(), v.clone()))),
         )];
-        for table in self.levels[0].iter().rev() {
-            sources.push(Box::new(table.iter(&self.fs)));
+        let wanted = move |t: &&Table| t.largest() >= start && end.is_none_or(|e| t.smallest() < e);
+        for table in self.levels[0].iter().rev().filter(wanted) {
+            sources.push(Box::new(table.iter_from(&self.fs, start)));
         }
         for level in self.levels[1..].iter().filter(|l| !l.is_empty()) {
-            sources.push(Box::new(level.iter().flat_map(|t| t.iter(&self.fs))));
+            let first = level.partition_point(|t| t.largest() < start);
+            let tables = level[first..]
+                .iter()
+                .take_while(move |t| end.is_none_or(|e| t.smallest() < e));
+            sources.push(Box::new(
+                tables.flat_map(move |t| t.iter_from(&self.fs, start)),
+            ));
         }
-        MergeIter::new(sources).filter_map(|entry| match entry {
-            Ok((k, Some(v))) => Some(Ok((k, v))),
-            Ok((_, None)) => None,
-            Err(e) => Some(Err(e)),
-        })
+        MergeIter::new(sources)
+            .take_while(move |entry| match (entry, end) {
+                (Ok((k, _)), Some(e)) => k.as_slice() < e,
+                _ => true,
+            })
+            .filter_map(|entry| match entry {
+                Ok((k, Some(v))) => Some(Ok((k, v))),
+                Ok((_, None)) => None,
+                Err(e) => Some(Err(e)),
+            })
     }
 
     pub fn scan(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -505,20 +539,17 @@ impl<F: Fs> Db<F> {
         Table::open(&self.fs, id, name)
     }
 
-    fn write(&mut self, op: Op) -> Result<()> {
+    fn write(&mut self, ops: Vec<Op>) -> Result<()> {
         self.seq += 1;
         let wal = wal_name(self.wal_id);
-        self.fs.append(
-            &wal,
-            &wal::encode(&Record {
-                seq: self.seq,
-                op: op.clone(),
-            }),
-        )?;
+        let rec = Record { seq: self.seq, ops };
+        self.fs.append(&wal, &wal::encode(&rec))?;
         if self.opts.sync == SyncMode::Always {
             self.fs.sync(&wal)?;
         }
-        self.apply(op);
+        for op in rec.ops {
+            self.apply(op);
+        }
         if self.mem_bytes >= self.opts.memtable_bytes {
             self.flush()?;
         }
@@ -548,7 +579,9 @@ impl<F: Fs> Db<F> {
         self.stats.recovered_records = records.len() as u64;
         for rec in records {
             self.seq = self.seq.max(rec.seq);
-            self.apply(rec.op);
+            for op in rec.ops {
+                self.apply(op);
+            }
         }
         if valid < data.len() {
             self.stats.truncated_tail_bytes = (data.len() - valid) as u64;

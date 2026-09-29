@@ -17,11 +17,11 @@
 //! checksummed, and a table is synced before any manifest names it, so a
 //! checksum failure here is real corruption, never an expected crash artefact.
 
-use crate::bloom::{self, Bloom};
 use crate::codec::{Reader, put_bytes, put_u32, put_u64};
 use crate::crc::crc32;
 use crate::error::{Error, Result};
-use crate::fs::Fs;
+use crate::storage::bloom::{self, Bloom};
+use crate::storage::fs::Fs;
 
 const MAGIC: &[u8; 8] = b"QDBSST02";
 const FOOTER: u64 = 44;
@@ -316,6 +316,23 @@ impl Table {
             buf: Vec::new().into_iter(),
         }
     }
+
+    /// Entries with keys at or after `start`, skipping every block that
+    /// ends before it.
+    pub fn iter_from<'a, F: Fs>(
+        &'a self,
+        fs: &'a F,
+        start: &'a [u8],
+    ) -> impl Iterator<Item = Result<Entry>> + 'a {
+        let first = self.index.partition_point(|h| h.last.as_slice() < start);
+        let it = TableIter {
+            table: self,
+            fs,
+            next_block: first,
+            buf: Vec::new().into_iter(),
+        };
+        it.skip_while(move |e| matches!(e, Ok((k, _)) if k.as_slice() < start))
+    }
 }
 
 pub struct TableIter<'a, F: Fs> {
@@ -352,7 +369,7 @@ impl<F: Fs> Iterator for TableIter<'_, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::SimFs;
+    use crate::storage::fs::SimFs;
 
     fn build(n: u32, block_bytes: usize) -> (SimFs, Table) {
         let fs = SimFs::new(1);
