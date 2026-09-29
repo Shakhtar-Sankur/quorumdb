@@ -8,6 +8,8 @@ use quorumdb::{Db, Options, RealFs, SyncMode, sim};
 
 const USAGE: &str = "\
 usage:
+  quorumdb server <dir> [--nodes N] [--listen ADDR]
+                                             run a SQL server (Postgres protocol) on an N-node cluster
   quorumdb shell <dir>                       interactive shell on a real directory
   quorumdb sim [--seeds N] [--steps N] [--from S] [--fault NAME]
                                              run the crash simulator
@@ -36,6 +38,7 @@ fn main() -> ExitCode {
         Some("raft-sim") => raft_simulate(&args[1..]),
         Some("kv-sim") => kv_simulate(&args[1..]),
         Some("txn-sim") => txn_simulate(&args[1..]),
+        Some("server") if args.len() >= 2 => server(&args[1], &args[2..]),
         Some("bench") if args.len() >= 2 => bench(&args[1], &args[2..]),
         _ => Err(USAGE.to_string()),
     };
@@ -547,4 +550,21 @@ fn txn_simulate(args: &[String]) -> Result<(), String> {
         start.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+fn server(dir: &str, args: &[String]) -> Result<(), String> {
+    let (mut nodes, mut addr) = (3u64, "127.0.0.1:5432".to_string());
+    parse_flags(args, |flag, value| {
+        match flag {
+            "--nodes" => nodes = num(flag, value)?.max(1),
+            "--listen" => addr = value.to_string(),
+            other => return Err(format!("unknown flag: {other}\n{USAGE}")),
+        }
+        Ok(())
+    })?;
+    quorumdb::server::serve(quorumdb::server::ServerConfig {
+        dir: dir.to_string(),
+        nodes,
+        addr,
+    })
 }

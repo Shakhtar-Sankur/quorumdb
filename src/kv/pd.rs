@@ -96,6 +96,8 @@ impl Pd {
         let mut held = BTreeMap::new();
         for r in reports {
             let id = r.desc.id;
+            // Never hand out a range id that already exists (after a restart).
+            self.next_range = self.next_range.max(id + 1);
             held.insert(id, (r.desc.generation, r.replica));
             let newer = self
                 .ranges

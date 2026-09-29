@@ -12,10 +12,33 @@ FoundationDB is tested: deterministic simulation, where a single seed
 reproduces an entire run of random work, random crashes and random disk
 failures, exactly.
 
-**Status: milestones 1 to 5 of 8 are complete: a crash-safe LSM storage
-engine, Raft consensus, a sharded multi-Raft store that splits and
-rebalances itself, and distributed ACID transactions at snapshot and
-serializable isolation, every history machine-checked.**
+**Status: milestones 1 to 6 of 8 are complete: a distributed SQL database
+that `psql` connects to, on a sharded multi-Raft store that splits and
+rebalances itself, with serializable ACID transactions and a crash-safe
+LSM storage engine, every layer machine-checked by deterministic
+simulation.**
+
+```
+$ quorumdb server ./data            # three nodes, one process, three directories
+$ psql -h 127.0.0.1 -U quorum
+quorum=> SELECT c.name, COUNT(*), SUM(o.total) AS spent
+           FROM customers c JOIN orders o ON o.customer_id = c.id
+          GROUP BY c.name ORDER BY spent DESC;
+ name | count | spent
+------+-------+--------
+ Chen |     2 | 522.25
+ Asha |     2 |  349.5
+ Ben  |     1 |     40
+(3 rows)
+
+quorum=> EXPLAIN SELECT * FROM orders WHERE id >= 11 AND id < 14 AND shipped ORDER BY total LIMIT 2;
+                    QUERY PLAN
+---------------------------------------------------
+ Range scan orders on id [11, 14)
+   Filter (((id >= 11) AND (id < 14)) AND shipped)
+     Sort by total
+       Limit 2
+```
 
 ## The numbers that matter
 
@@ -252,6 +275,38 @@ It also found a bug in its own runtime before passing: a waiting task
 re-registered its timeout on every wake-up, so stale timers woke it again
 and multiplied, three million spurious wake-ups in ten simulated seconds.
 
+## SQL, over the PostgreSQL wire protocol
+
+`src/sql` and `src/server` put a SQL database on top of the transactions:
+
+- **A hand-written parser** for a practical PostgreSQL subset: `CREATE` and
+  `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`, `SELECT` with inner and left
+  joins, `WHERE`, `GROUP BY`, `HAVING`, aggregates, `ORDER BY`, `LIMIT` and
+  `OFFSET`, `LIKE`, three-valued NULL logic, `BEGIN`/`COMMIT`/`ROLLBACK`,
+  and `EXPLAIN`.
+- **Tables are keys.** Rows live under their table id and an
+  order-preserving encoding of the primary key, so a table splits across
+  ranges and nodes like any other data, and the catalog is transactional.
+- **A planner** that turns `pk = c` into a point lookup and bounds on the
+  primary key into a range scan touching only the ranges that hold it; an
+  equi-join becomes a hash join, anything else a nested loop.
+- **Sessions with PostgreSQL semantics.** Statements outside `BEGIN` run
+  in their own serializable transaction and are retried transparently if
+  they lose a conflict; inside one, an error aborts the block until
+  `ROLLBACK`, and conflicts surface as SQLSTATE `40001`.
+- **The Postgres wire protocol** (v3, simple query), so `psql` and other
+  clients connect. One event loop serves every connection as an async
+  session on the same deterministic runtime the simulator uses, next to a
+  cluster of nodes, each with its own directory on disk.
+
+Tested end to end on an in-process three-node cluster: joins, aggregates
+and plans; transactions and their error states; the classic **write-skew**
+anomaly (two doctors each going off call), which serializable isolation
+must refuse; and **concurrent bank transfers** by eight sessions while the
+table splits across ranges, after which every account still sums to the
+starting total. CI also starts the real server, runs a session through
+`psql`, restarts the server, and checks the data survived.
+
 ## Benchmarks
 
 One million keys with 100-byte values, default options, on a 4-core cloud
@@ -335,7 +390,8 @@ cargo run --release -- raft-sim --seeds 1000  # the Raft cluster simulator
 cargo run --release -- kv-sim --seeds 200     # the sharded cluster simulator
 cargo run --release -- txn-sim --seeds 50     # the distributed transaction simulator
 cargo run --release -- bench ./bench-db  # benchmarks on a real, empty directory
-cargo run --release -- shell ./data      # an interactive shell: put, get, del, scan, levels
+cargo run --release -- server ./data     # a SQL server; then: psql -h 127.0.0.1 -U quorum
+cargo run --release -- shell ./data      # a storage-engine shell: put, get, del, scan, levels
 ```
 
 A failing seed prints the command that replays it exactly.
@@ -349,14 +405,16 @@ A failing seed prints the command that replays it exactly.
 | 3 | Raft consensus, with partitions, crashes, clock skew and membership changes in the simulator | done |
 | 4 | Multi-Raft: replicas on the storage engine, range sharding, automatic splits and rebalancing | done |
 | 5 | Distributed transactions: snapshot isolation, then serializable | done |
-| 6 | SQL: parser, planner, executor, Postgres wire protocol | next |
-| 7 | TLA+ model of the transaction protocol; TPC-C benchmarks | |
+| 6 | SQL: parser, planner, executor, Postgres wire protocol | done |
+| 7 | TLA+ model of the transaction protocol; TPC-C benchmarks | next |
 | 8 | A time-travel debugger: replay any seed and step through the cluster | |
 
 ## Honest limits today
 
-- The cluster runs in the simulator and in tests; there is no network
-  server yet (it arrives with the SQL layer in milestone 6).
+- The server runs every node in one process, joined by an in-memory
+  network; nodes do not yet talk to each other over TCP.
+- SQL: no secondary indexes, subqueries or prepared statements (the
+  extended query protocol) yet; one-column primary keys only.
 - The placement driver is one soft-state process, not yet replicated, and
   ranges split but never merge.
 - Old MVCC versions are never garbage-collected, and a long transaction's

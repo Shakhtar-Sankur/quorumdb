@@ -98,6 +98,31 @@ jobs:
             fi
           done
 
+  psql:
+    name: psql against a real 3-node server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get install -y postgresql-client
+      - run: cargo build --release
+      - name: start the server
+        run: |
+          ./target/release/quorumdb server "$RUNNER_TEMP/data" --listen 127.0.0.1:5433 &
+          sleep 2
+      - name: run a SQL session through psql
+        run: |
+          psql -h 127.0.0.1 -p 5433 -U quorum -d quorum -v ON_ERROR_STOP=0 -f examples/demo.sql | tee out.txt
+          grep -q "Chen | *2 | *522.25" out.txt
+          grep -q "Range scan orders" out.txt
+      - name: restart the server; the data is still there
+        run: |
+          pkill -x quorumdb
+          sleep 1
+          ./target/release/quorumdb server "$RUNNER_TEMP/data" --listen 127.0.0.1:5433 &
+          sleep 2
+          psql -h 127.0.0.1 -p 5433 -U quorum -d quorum -tA -c "SELECT COUNT(*) FROM customers" | grep -qx 4
+
   bench:
     name: benchmark
     runs-on: ubuntu-latest

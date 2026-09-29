@@ -13,6 +13,8 @@ pub mod kv;
 pub mod raft;
 pub mod rng;
 pub mod runtime;
+pub mod server;
+pub mod sql;
 pub mod storage;
 pub mod txn;
 
