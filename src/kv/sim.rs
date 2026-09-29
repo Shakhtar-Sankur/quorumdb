@@ -150,6 +150,7 @@ impl Sim {
                 fault: crate::storage::engine::Fault::None,
             },
             fault,
+            mvcc_fault: crate::txn::mvcc::MvccFault::None,
         };
         let key_count = 20 + rng.below(100);
         let keys = (0..key_count)

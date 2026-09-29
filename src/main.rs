@@ -15,6 +15,8 @@ usage:
                                              run the Raft cluster simulator
   quorumdb kv-sim [--seeds N] [--ms N] [--from S] [--fault NAME]
                                              run the multi-Raft cluster simulator
+  quorumdb txn-sim [--seeds N] [--ms N] [--from S] [--fault NAME]
+                                             run the distributed transaction simulator
   quorumdb bench <empty dir> [--keys N] [--value-bytes N] [--reads N]
                                              benchmark on a real directory
 storage faults (to prove the simulator catches them):
@@ -22,7 +24,9 @@ storage faults (to prove the simulator catches them):
 raft faults:
   vote-ignores-log | commit-old-term | skip-prev-check | read-without-quorum
 cluster faults:
-  skip-raft-sync | stale-local-reads | snapshot-self-removal";
+  skip-raft-sync | stale-local-reads | snapshot-self-removal
+transaction faults:
+  skip-write-conflict | read-ignores-locks | skip-read-validation | tso-serve-before-durable";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -31,6 +35,7 @@ fn main() -> ExitCode {
         Some("sim") => simulate(&args[1..]),
         Some("raft-sim") => raft_simulate(&args[1..]),
         Some("kv-sim") => kv_simulate(&args[1..]),
+        Some("txn-sim") => txn_simulate(&args[1..]),
         Some("bench") if args.len() >= 2 => bench(&args[1], &args[2..]),
         _ => Err(USAGE.to_string()),
     };
@@ -480,6 +485,66 @@ fn kv_simulate(args: &[String]) -> Result<(), String> {
         t.reads,
         t.unknown,
         t.keys_checked
+    );
+    Ok(())
+}
+
+fn txn_simulate(args: &[String]) -> Result<(), String> {
+    use quorumdb::txn::sim::{self as tsim, TxnSimFault};
+    let (mut seeds, mut ms, mut from, mut fault_name) =
+        (20u64, 10_000u64, 0u64, "none".to_string());
+    parse_flags(args, |flag, value| {
+        match flag {
+            "--seeds" => seeds = num(flag, value)?,
+            "--ms" => ms = num(flag, value)?,
+            "--from" => from = num(flag, value)?,
+            "--fault" => fault_name = value.to_string(),
+            other => return Err(format!("unknown flag: {other}\n{USAGE}")),
+        }
+        Ok(())
+    })?;
+    let fault = match fault_name.as_str() {
+        "none" => TxnSimFault::None,
+        "skip-write-conflict" => TxnSimFault::SkipWriteConflict,
+        "read-ignores-locks" => TxnSimFault::ReadIgnoresLocks,
+        "skip-read-validation" => TxnSimFault::SkipReadValidation,
+        "tso-serve-before-durable" => TxnSimFault::TsoServeBeforeDurable,
+        other => return Err(format!("unknown fault: {other}\n{USAGE}")),
+    };
+    let start = Instant::now();
+    let (mut committed, mut aborted, mut resolved, mut crashes, mut partitions, mut edges) =
+        (0, 0, 0, 0, 0, 0);
+    let (mut si_runs, mut ser_runs, mut skew) = (0, 0, 0);
+    for seed in from..from + seeds {
+        match tsim::run(seed, ms, fault) {
+            Ok(r) => {
+                committed += r.committed;
+                aborted += r.aborted;
+                resolved += r.unknown_resolved;
+                crashes += r.crashes;
+                partitions += r.partitions;
+                edges += r.dependency_edges;
+                if r.serializable {
+                    ser_runs += 1;
+                } else {
+                    si_runs += 1;
+                    skew += r.write_skew_seen as u64;
+                }
+            }
+            Err(msg) => {
+                return Err(format!(
+                    "FAILED {msg}\nreplay: quorumdb txn-sim --from {seed} --seeds 1 --ms {ms} --fault {fault_name}"
+                ));
+            }
+        }
+    }
+    println!(
+        "ok: {seeds} clusters x {:.0}s simulated in {:.1}s ({ser_runs} serializable, {si_runs} snapshot isolation)\n  \
+         {committed} transactions committed, {aborted} aborted, {resolved} with lost outcomes resolved afterwards\n  \
+         {crashes} crashes, {partitions} partitions; {edges} dependency edges checked\n  \
+         serializable runs: every history serializable; snapshot runs: all snapshot isolated, {skew} showed write skew (allowed)",
+        ms as f64 / 1000.0,
+        start.elapsed().as_secs_f64()
     );
     Ok(())
 }

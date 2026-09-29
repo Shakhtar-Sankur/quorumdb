@@ -12,11 +12,22 @@ FoundationDB is tested: deterministic simulation, where a single seed
 reproduces an entire run of random work, random crashes and random disk
 failures, exactly.
 
-**Status: milestones 1 to 4 of 8 are complete: a crash-safe LSM storage
-engine, Raft consensus, and a sharded multi-Raft key-value store that splits
-and rebalances itself, with every history checked for linearizability.**
+**Status: milestones 1 to 5 of 8 are complete: a crash-safe LSM storage
+engine, Raft consensus, a sharded multi-Raft store that splits and
+rebalances itself, and distributed ACID transactions at snapshot and
+serializable isolation, every history machine-checked.**
 
 ## The numbers that matter
+
+Distributed transactions, 300 simulated clusters:
+
+```
+$ quorumdb txn-sim --seeds 300
+ok: 300 clusters x 10s simulated in 395.4s (155 serializable, 145 snapshot isolation)
+  44258 transactions committed, 10765 aborted, 0 with lost outcomes resolved afterwards
+  2262 crashes, 1796 partitions; 193205 dependency edges checked
+  serializable runs: every history serializable; snapshot runs: all snapshot isolated, 136 showed write skew (allowed)
+```
 
 The sharded key-value store: 1,500 simulated clusters, each with 3 to 5
 nodes on crashing disks, 10 seconds of simulated time plus recovery:
@@ -183,6 +194,64 @@ It catches three planted bugs:
 $ cargo test --release --test cluster every_planted_cluster_bug_is_caught -- --nocapture
 ```
 
+## Distributed transactions
+
+`src/txn` adds ACID transactions across ranges and nodes, after Google's
+Percolator, as TiDB uses it:
+
+- **A timestamp oracle** served by the first range's leader. It hands out
+  timestamps only after confirming its leadership with ReadIndex, and only
+  from a window already made durable through Raft, so a new leader always
+  starts above every timestamp an old one issued.
+- **MVCC.** Every key keeps its committed versions, newest first, plus at
+  most one lock. A read at timestamp `t` sees the newest commit at or below
+  `t`; a lock in the way belongs to a transaction that might commit below
+  `t`, so the reader first learns its fate from its primary key.
+- **Two-phase commit, crash-proof.** Prewrite locks every written key,
+  refusing if anyone committed it since our snapshot (first committer wins,
+  so no lost updates). The commit of the *primary* key is the single commit
+  point. A crashed transaction's locks are finished or rolled back by
+  whoever meets them next; a rollback leaves a fence so a late prewrite
+  cannot resurrect it.
+- **Two isolation levels.** *Snapshot isolation*, and *serializable* via
+  write-snapshot isolation (Yabandeh and Gómez Ferro): at commit, every key
+  and every range the transaction read is validated for commits between
+  its start and commit timestamps, which rules out write skew and phantoms.
+- **An async client.** Transaction logic is plain sequential `async` Rust,
+  run by a small deterministic executor (`src/runtime.rs`), so the same
+  code runs in the simulator and, later, in the server.
+
+The transaction simulator runs clients doing point reads, writes and
+multi-range scans against the full cluster while nodes crash, the network
+partitions, and ranges split and move. Transactions whose outcome was lost
+are resolved afterwards through their primary key. Then an isolation
+checker in the spirit of Jepsen's Elle verifies the whole history:
+
+- **Snapshot isolation**, exactly, against the timestamps used: each read
+  saw the newest version committed at or before its snapshot; no two
+  overlapping transactions both committed a write to one key; and a
+  transaction that began after another finished got a later timestamp.
+- **Serializability**, when asked for: the dependency graph of ww, wr and rw
+  edges (Adya) has no cycle. Under snapshot isolation the checker reports
+  the write-skew cycles it sees, which that level allows.
+
+It catches four planted bugs, each at a real history it prints:
+
+| Planted bug | What the checker found |
+|---|---|
+| Prewrite skips the write-write conflict check | `lost update: T1000004 [30, 34] and T2000004 [33, 37] both wrote the same key and committed` |
+| Reads ignore locks | `T4000002 (snapshot at 9) read key "key018" and saw no version; its snapshot holds T1000001's version` |
+| Serializable commits skip read validation | `not serializable: dependency cycle T2000029 -rw-> T22 -wr-> T23 -rw-> T1000020 -rw-> T2000029` |
+| The oracle serves timestamps before its window is durable | After a leader crash, a snapshot missed a version committed below it |
+
+```
+$ cargo test --release --test txn every_planted_transaction_bug_is_caught -- --nocapture
+```
+
+It also found a bug in its own runtime before passing: a waiting task
+re-registered its timeout on every wake-up, so stale timers woke it again
+and multiplied, three million spurious wake-ups in ten simulated seconds.
+
 ## Benchmarks
 
 One million keys with 100-byte values, default options, on a 4-core cloud
@@ -264,6 +333,7 @@ cargo test --release                     # unit, simulation and real-disk tests
 cargo run --release -- sim --seeds 1000  # the storage crash simulator
 cargo run --release -- raft-sim --seeds 1000  # the Raft cluster simulator
 cargo run --release -- kv-sim --seeds 200     # the sharded cluster simulator
+cargo run --release -- txn-sim --seeds 50     # the distributed transaction simulator
 cargo run --release -- bench ./bench-db  # benchmarks on a real, empty directory
 cargo run --release -- shell ./data      # an interactive shell: put, get, del, scan, levels
 ```
@@ -278,8 +348,8 @@ A failing seed prints the command that replays it exactly.
 | 2 | Block-indexed tables read from disk, bloom filters, leveled compaction, CI, benchmarks | done |
 | 3 | Raft consensus, with partitions, crashes, clock skew and membership changes in the simulator | done |
 | 4 | Multi-Raft: replicas on the storage engine, range sharding, automatic splits and rebalancing | done |
-| 5 | Distributed transactions: snapshot isolation, then serializable | next |
-| 6 | SQL: parser, planner, executor, Postgres wire protocol | |
+| 5 | Distributed transactions: snapshot isolation, then serializable | done |
+| 6 | SQL: parser, planner, executor, Postgres wire protocol | next |
 | 7 | TLA+ model of the transaction protocol; TPC-C benchmarks | |
 | 8 | A time-travel debugger: replay any seed and step through the cluster | |
 
@@ -289,6 +359,8 @@ A failing seed prints the command that replays it exactly.
   server yet (it arrives with the SQL layer in milestone 6).
 - The placement driver is one soft-state process, not yet replicated, and
   ranges split but never merge.
+- Old MVCC versions are never garbage-collected, and a long transaction's
+  locks have no heartbeat to extend their time-to-live.
 - Snapshots are sent as one message, which suits the simulator's small
   ranges but not multi-gigabyte ones.
 - Compaction runs inline on the writing thread, so a write that triggers it

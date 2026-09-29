@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use crate::codec::{Reader, put_bytes, put_u32};
 use crate::error::{Error, Result};
-use crate::kv::cmd::{Command, KvError, ReqId, Request, Response};
+use crate::kv::cmd::{Command, KvError, ReqId, Request, Response, TSO_KEY};
 use crate::kv::keys::{self, AppliedState, RangeDescriptor, RangeId, ReplicaId};
 use crate::raft::{
     self, Entry, EntryData, HardState, Msg, NodeId, ProposeError, Raft, Ready, Snapshot,
@@ -29,11 +29,15 @@ use crate::raft::{
 use crate::storage::engine::{Db, Options, SyncMode};
 use crate::storage::fs::Fs;
 use crate::storage::wal::Op;
+use crate::txn::mvcc::{self, MvccError, MvccFault, Overlay};
 
 /// A range's log starts here, so every replica, including ones created by
 /// a split, begins from the same synthetic snapshot.
 pub const INIT_INDEX: u64 = 5;
 pub const INIT_TERM: u64 = 5;
+
+/// How far the timestamp oracle extends its durable window at a time.
+const TSO_STEP: u64 = 16;
 
 /// Deliberately broken behaviour, to prove the cluster simulator catches it.
 #[doc(hidden)]
@@ -48,6 +52,9 @@ pub enum StoreFault {
     /// Treat a snapshot that does not list this replica as its removal: a
     /// bug the simulator found. The snapshot can predate our own addition.
     SnapshotSelfRemoval,
+    /// Hand out timestamps from a window extension before it is durable: a
+    /// new leader after a crash then issues the same timestamps again.
+    TsoServeBeforeDurable,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +64,7 @@ pub struct StoreConfig {
     pub compact_after: u64,
     pub engine: Options,
     pub fault: StoreFault,
+    pub mvcc_fault: MvccFault,
 }
 
 impl Default for StoreConfig {
@@ -69,6 +77,7 @@ impl Default for StoreConfig {
                 ..Options::default()
             },
             fault: StoreFault::None,
+            mvcc_fault: MvccFault::None,
         }
     }
 }
@@ -109,6 +118,12 @@ struct Replica {
     ready_reads: Vec<(u64, ReqId, Request)>,
     /// Removed from the range: destroy after this round.
     removed: bool,
+    /// The timestamp oracle window this leader may hand out from:
+    /// `(term, next, limit)`. Rebuilt from the durable limit each term.
+    tso: Option<(u64, u64, u64)>,
+    /// Timestamp requests waiting for the window to be extended.
+    tso_waiting: Vec<(ReqId, u64)>,
+    tso_extending: bool,
 }
 
 pub struct Store<F: Fs> {
@@ -122,6 +137,8 @@ pub struct Store<F: Fs> {
     responses: Vec<(ReqId, std::result::Result<Response, KvError>)>,
     next_read: u64,
     seed: u64,
+    /// This node's clock in milliseconds, set by whoever drives the store.
+    now: u64,
 }
 
 fn snapshot_data(desc: &RangeDescriptor, pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
@@ -174,6 +191,7 @@ impl<F: Fs> Store<F> {
             responses: Vec::new(),
             next_read: 0,
             seed,
+            now: 0,
         };
         store.load()?;
         Ok(store)
@@ -300,6 +318,11 @@ impl<F: Fs> Store<F> {
 
     // ─── Inputs ──────────────────────────────────────────────────────────
 
+    /// Tell the store what time it is (milliseconds, this node's clock).
+    pub fn set_clock(&mut self, now: u64) {
+        self.now = now;
+    }
+
     pub fn tick(&mut self) {
         for r in self.replicas.values_mut() {
             r.raft.tick();
@@ -372,16 +395,22 @@ impl<F: Fs> Store<F> {
         if !replica.raft.is_leader() {
             return Err(KvError::NotLeader(replica.raft.leader().map(keys::node_of)));
         }
-        let key = match &req {
-            Request::Get { key } | Request::Put { key, .. } | Request::Delete { key } => Some(key),
-            Request::Scan { start, .. } => Some(start),
-            _ => None,
-        };
-        if key.is_some_and(|k| !desc.contains(k)) {
+        let routed = !matches!(
+            req,
+            Request::Split { .. } | Request::ChangeReplicas { .. } | Request::TransferLeader { .. }
+        );
+        if routed && !desc.contains(req.routing_key()) {
             return Err(KvError::KeyNotInRange);
         }
+        let now = self.now;
         match req {
-            Request::Get { .. } | Request::Scan { .. } => {
+            Request::Get { .. }
+            | Request::Scan { .. }
+            | Request::MvccGet { .. }
+            | Request::MvccScan { .. }
+            | Request::ValidateRead { .. }
+            | Request::ValidateScan { .. }
+            | Request::Timestamp { .. } => {
                 if fault == StoreFault::StaleLocalReads {
                     replica.ready_reads.push((0, req_id, req));
                     return Ok(());
@@ -396,6 +425,58 @@ impl<F: Fs> Store<F> {
                 self.propose(range, req_id, Command::Put { key, value })?
             }
             Request::Delete { key } => self.propose(range, req_id, Command::Delete { key })?,
+            Request::Prewrite {
+                key,
+                value,
+                primary,
+                start_ts,
+                ttl,
+            } => {
+                let cmd = Command::Prewrite {
+                    key,
+                    value,
+                    primary,
+                    start_ts,
+                    ttl,
+                    now,
+                };
+                self.propose(range, req_id, cmd)?
+            }
+            Request::Commit {
+                key,
+                start_ts,
+                commit_ts,
+            } => {
+                let cmd = Command::Commit {
+                    key,
+                    start_ts,
+                    commit_ts,
+                };
+                self.propose(range, req_id, cmd)?
+            }
+            Request::Rollback { key, start_ts } => {
+                self.propose(range, req_id, Command::Rollback { key, start_ts })?
+            }
+            Request::CheckTxnStatus { primary, start_ts } => {
+                let cmd = Command::CheckTxnStatus {
+                    primary,
+                    start_ts,
+                    now,
+                };
+                self.propose(range, req_id, cmd)?
+            }
+            Request::ResolveLock {
+                key,
+                start_ts,
+                commit_ts,
+            } => {
+                let cmd = Command::ResolveLock {
+                    key,
+                    start_ts,
+                    commit_ts,
+                };
+                self.propose(range, req_id, cmd)?
+            }
             Request::Split { key, new_range } => {
                 if key <= desc.start || !desc.contains(&key) {
                     return Err(KvError::KeyNotInRange);
@@ -422,6 +503,60 @@ impl<F: Fs> Store<F> {
             }
         }
         Ok(())
+    }
+
+    /// Hand out `count` timestamps from this leader's window, extending the
+    /// window through Raft when it runs out. The window restarts from the
+    /// durable limit in every term, so a new leader always starts above
+    /// anything an old one handed out.
+    fn serve_timestamp(&mut self, range: RangeId, req_id: ReqId, count: u64) {
+        let persisted = match self.db.get(&keys::raw_key(TSO_KEY)) {
+            Ok(v) => v.and_then(|v| keys::decode_u64(&v)).unwrap_or(0),
+            Err(e) => {
+                self.responses
+                    .push((req_id, Err(KvError::Storage(e.to_string()))));
+                return;
+            }
+        };
+        let Some(replica) = self.replicas.get_mut(&range) else {
+            self.responses.push((req_id, Err(KvError::RangeNotFound)));
+            return;
+        };
+        if !replica.raft.is_leader() {
+            self.responses.push((
+                req_id,
+                Err(KvError::NotLeader(replica.raft.leader().map(keys::node_of))),
+            ));
+            return;
+        }
+        let term = replica.raft.term();
+        if replica.tso.is_none_or(|(t, _, _)| t != term) {
+            replica.tso = Some((term, persisted + 1, persisted));
+            replica.tso_extending = false;
+        }
+        let (t, next, limit) = replica.tso.expect("set");
+        if next + count - 1 <= limit {
+            replica.tso = Some((t, next + count, limit));
+            self.responses.push((req_id, Ok(Response::Ts(next))));
+            return;
+        }
+        // Extend in small steps, so leader changes land mid-window often.
+        let new_limit = limit.max(next + count - 1) + TSO_STEP;
+        if self.cfg.fault == StoreFault::TsoServeBeforeDurable {
+            let _ = replica
+                .raft
+                .propose(Command::TsoExtend { limit: new_limit }.encode());
+            replica.tso = Some((t, next + count, new_limit));
+            self.responses.push((req_id, Ok(Response::Ts(next))));
+            return;
+        }
+        replica.tso_waiting.push((req_id, count));
+        if !replica.tso_extending {
+            let cmd = Command::TsoExtend { limit: new_limit };
+            if replica.raft.propose(cmd.encode()).is_ok() {
+                replica.tso_extending = true;
+            }
+        }
     }
 
     fn propose(
@@ -460,7 +595,7 @@ impl<F: Fs> Store<F> {
                         .range(&lo, Some(&hi))
                         .filter_map(|r| r.ok().map(|(k, _)| k))
                         .collect();
-                    let mid = all.get(all.len() / 2).map(|k| keys::user_key(k).to_vec());
+                    let mid = all.get(all.len() / 2).map(|k| keys::user_key(k));
                     (all.len() as u64, mid)
                 } else {
                     (0, None)
@@ -557,7 +692,7 @@ impl<F: Fs> Store<F> {
                     ops.push(Op::Delete(row?.0));
                 }
                 for (k, v) in pairs {
-                    ops.push(Op::Put(keys::data_key(&k), v));
+                    ops.push(Op::Put(k, v));
                 }
                 let applied = AppliedState {
                     index: snap.meta.index,
@@ -665,12 +800,9 @@ impl<F: Fs> Store<F> {
             let Some(meta) = replica.raft.snapshot_meta(replica.applied) else {
                 continue;
             };
+            // Every column family of every key in the span, verbatim.
             let (lo, hi) = keys::data_span(&desc.start, &desc.end);
-            let pairs = self
-                .db
-                .range(&lo, Some(&hi))
-                .map(|row| row.map(|(k, v)| (keys::user_key(&k).to_vec(), v)))
-                .collect::<Result<Vec<_>>>()?;
+            let pairs = self.db.range(&lo, Some(&hi)).collect::<Result<Vec<_>>>()?;
             let data = snapshot_data(&desc, &pairs);
             let replica = self.replicas.get_mut(&range).expect("present");
             replica.raft.send_snapshot(peer, Snapshot { meta, data });
@@ -686,13 +818,16 @@ impl<F: Fs> Store<F> {
         range: RangeId,
         entries: &[Entry],
     ) -> Result<Vec<(RangeDescriptor, ReplicaId, HardState)>> {
-        let mut ops = Vec::new();
+        let mvcc_fault = self.cfg.mvcc_fault;
         let mut created: Vec<RangeDescriptor> = Vec::new();
+        let mut tso_limit = None;
         let replica = self.replicas.get_mut(&range).expect("present");
         let rid = replica.raft.id;
         let Some(mut desc) = replica.desc.clone() else {
             return Ok(Vec::new());
         };
+        // Every command sees the effects of the ones before it in the batch.
+        let mut ov = Overlay::new(&self.db);
         let mut last_term = 0;
         for e in entries {
             last_term = e.term;
@@ -707,46 +842,17 @@ impl<F: Fs> Store<F> {
                 }
                 EntryData::Command(bytes) => match Command::decode(bytes) {
                     None => Err(KvError::Storage("undecodable command".into())),
-                    Some(Command::Put { key, value }) => {
-                        if desc.contains(&key) {
-                            ops.push(Op::Put(keys::data_key(&key), value));
-                            Ok(Response::Done)
-                        } else {
-                            Err(KvError::KeyNotInRange)
-                        }
+                    Some(cmd) if cmd.key().is_some_and(|k| !desc.contains(k)) => {
+                        Err(KvError::KeyNotInRange)
                     }
-                    Some(Command::Delete { key }) => {
-                        if desc.contains(&key) {
-                            ops.push(Op::Delete(keys::data_key(&key)));
-                            Ok(Response::Done)
-                        } else {
-                            Err(KvError::KeyNotInRange)
-                        }
-                    }
-                    Some(Command::Split {
-                        key,
-                        new_range,
-                        generation,
-                    }) => {
-                        if generation != desc.generation
-                            || key <= desc.start
-                            || !desc.contains(&key)
-                        {
-                            Err(KvError::Busy)
-                        } else {
-                            let rhs = RangeDescriptor {
-                                id: new_range,
-                                start: key.clone(),
-                                end: std::mem::replace(&mut desc.end, key),
-                                replicas: desc.replicas.clone(),
-                                generation: 0,
-                                next_incarnation: desc.next_incarnation,
-                            };
-                            desc.generation += 1;
-                            created.push(rhs);
-                            Ok(Response::Done)
-                        }
-                    }
+                    Some(cmd) => apply_command(
+                        &mut ov,
+                        &mut desc,
+                        &mut created,
+                        &mut tso_limit,
+                        cmd,
+                        mvcc_fault,
+                    )?,
                 },
             };
             if let Some((term, req_id)) = replica.proposals.remove(&e.index) {
@@ -758,6 +864,7 @@ impl<F: Fs> Store<F> {
                 self.responses.push((req_id, result));
             }
         }
+        let mut ops = ov.into_ops();
         let last = entries.last().expect("non-empty").index;
         replica.applied = last;
         replica.desc = Some(desc.clone());
@@ -771,6 +878,12 @@ impl<F: Fs> Store<F> {
             keys::applied_key(range),
             keys::encode_applied(&applied),
         ));
+        if let Some(limit) = tso_limit {
+            replica.tso_extending = false;
+            if let Some((t, next, old)) = replica.tso {
+                replica.tso = Some((t, next, old.max(limit)));
+            }
+        }
 
         // A split creates the right-hand range here at its initial snapshot,
         // unless this node's replica of it is already initialized (added by
@@ -795,15 +908,29 @@ impl<F: Fs> Store<F> {
             }
         }
         self.db.write_batch(ops)?;
+
+        // The oracle's window grew: serve the timestamp requests waiting on it.
+        if tso_limit.is_some() {
+            let waiting =
+                std::mem::take(&mut self.replicas.get_mut(&range).expect("present").tso_waiting);
+            for (req_id, count) in waiting {
+                self.serve_timestamp(range, req_id, count);
+            }
+        }
         Ok(new_ranges)
     }
 
     fn serve_reads(&mut self) -> Result<()> {
         let fault = self.cfg.fault;
-        for replica in self.replicas.values_mut() {
-            if replica.ready_reads.is_empty() {
-                continue;
-            }
+        let mvcc_fault = self.cfg.mvcc_fault;
+        let ids: Vec<RangeId> = self
+            .replicas
+            .iter()
+            .filter(|(_, r)| !r.ready_reads.is_empty())
+            .map(|(&id, _)| id)
+            .collect();
+        for range in ids {
+            let replica = self.replicas.get_mut(&range).expect("present");
             let applied = replica.applied;
             let (now, later): (Vec<_>, Vec<_>) =
                 replica.ready_reads.drain(..).partition(|(index, _, _)| {
@@ -812,38 +939,27 @@ impl<F: Fs> Store<F> {
             replica.ready_reads = later;
             let desc = replica.desc.clone();
             for (_, req_id, req) in now {
-                let result = match (&desc, req) {
-                    (None, _) => Err(KvError::RangeNotFound),
-                    (Some(d), Request::Get { key }) => {
-                        if d.contains(&key) {
-                            Ok(Response::Value(self.db.get(&keys::data_key(&key))?))
-                        } else {
-                            Err(KvError::KeyNotInRange)
-                        }
-                    }
-                    (Some(d), Request::Scan { start, end, limit }) => {
-                        if !d.contains(&start) {
-                            Err(KvError::KeyNotInRange)
-                        } else {
-                            // Clamp to this range; the client continues in the next.
-                            let clamped = !d.end.is_empty() && (end.is_empty() || d.end < end);
-                            let stop = if clamped { d.end.clone() } else { end };
-                            let (lo, hi) = keys::data_span(&start, &stop);
-                            let rows = self
-                                .db
-                                .range(&lo, Some(&hi))
-                                .take(limit)
-                                .map(|row| row.map(|(k, v)| (keys::user_key(&k).to_vec(), v)))
-                                .collect::<Result<Vec<_>>>()?;
-                            Ok(Response::Rows {
-                                rows,
-                                resume: clamped.then(|| d.end.clone()),
-                            })
-                        }
-                    }
-                    _ => Err(KvError::Busy),
+                if let Request::Timestamp { count } = req {
+                    self.serve_timestamp(range, req_id, count);
+                    continue;
+                }
+                let result = match &desc {
+                    None => Err(KvError::RangeNotFound),
+                    Some(d) if !d.contains(req.routing_key()) => Err(KvError::KeyNotInRange),
+                    Some(d) => serve_read(&self.db, d, req, mvcc_fault)?,
                 };
                 self.responses.push((req_id, result));
+            }
+        }
+        // Leaders that lost leadership fail their waiting timestamp requests.
+        for replica in self.replicas.values_mut() {
+            if !replica.raft.is_leader() && !replica.tso_waiting.is_empty() {
+                replica.tso = None;
+                replica.tso_extending = false;
+                let hint = replica.raft.leader().map(keys::node_of);
+                for (req_id, _) in replica.tso_waiting.drain(..) {
+                    self.responses.push((req_id, Err(KvError::NotLeader(hint))));
+                }
             }
         }
         Ok(())
@@ -989,8 +1105,196 @@ impl<F: Fs> Store<F> {
 
     /// Read a user key straight from this store's engine (for checks).
     pub fn local_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.db.get(&keys::data_key(key))
+        self.db.get(&keys::raw_key(key))
     }
+}
+
+fn mvcc_error(e: MvccError) -> KvError {
+    match e {
+        MvccError::Locked(l) => KvError::Locked(l),
+        MvccError::WriteConflict => KvError::WriteConflict,
+        MvccError::Aborted => KvError::Aborted,
+        MvccError::AlreadyCommitted(ts) => KvError::AlreadyCommitted(ts),
+    }
+}
+
+/// Evaluate one command against the range's state (through the batch
+/// overlay). Deterministic: every replica computes the same result.
+fn apply_command<F: Fs>(
+    ov: &mut Overlay<F>,
+    desc: &mut RangeDescriptor,
+    created: &mut Vec<RangeDescriptor>,
+    tso_limit: &mut Option<u64>,
+    cmd: Command,
+    fault: MvccFault,
+) -> Result<std::result::Result<Response, KvError>> {
+    let done =
+        |r: std::result::Result<(), MvccError>| r.map(|_| Response::Done).map_err(mvcc_error);
+    Ok(match cmd {
+        Command::Put { key, value } => {
+            ov.put(keys::raw_key(&key), value);
+            Ok(Response::Done)
+        }
+        Command::Delete { key } => {
+            ov.delete(keys::raw_key(&key));
+            Ok(Response::Done)
+        }
+        Command::Split {
+            key,
+            new_range,
+            generation,
+        } => {
+            if generation != desc.generation || key <= desc.start || !desc.contains(&key) {
+                Err(KvError::Busy)
+            } else {
+                let rhs = RangeDescriptor {
+                    id: new_range,
+                    start: key.clone(),
+                    end: std::mem::replace(&mut desc.end, key),
+                    replicas: desc.replicas.clone(),
+                    generation: 0,
+                    next_incarnation: desc.next_incarnation,
+                };
+                desc.generation += 1;
+                created.push(rhs);
+                Ok(Response::Done)
+            }
+        }
+        Command::Prewrite {
+            key,
+            value,
+            primary,
+            start_ts,
+            ttl,
+            now,
+        } => {
+            let p = mvcc::Prewrite {
+                key,
+                value,
+                primary,
+                start_ts,
+                ttl,
+                now,
+            };
+            done(mvcc::prewrite(ov, p, fault)?)
+        }
+        Command::Commit {
+            key,
+            start_ts,
+            commit_ts,
+        } => done(mvcc::commit(ov, &key, start_ts, commit_ts)?),
+        Command::Rollback { key, start_ts } => done(mvcc::rollback(ov, &key, start_ts)?),
+        Command::CheckTxnStatus {
+            primary,
+            start_ts,
+            now,
+        } => Ok(Response::Status(mvcc::check_txn_status(
+            ov, &primary, start_ts, now,
+        )?)),
+        Command::ResolveLock {
+            key,
+            start_ts,
+            commit_ts,
+        } => {
+            mvcc::resolve(ov, &key, start_ts, commit_ts)?;
+            Ok(Response::Done)
+        }
+        Command::TsoExtend { limit } => {
+            let tso = keys::raw_key(TSO_KEY);
+            let old = ov
+                .get(&tso)?
+                .and_then(|v| keys::decode_u64(&v))
+                .unwrap_or(0);
+            let new = old.max(limit);
+            ov.put(tso, keys::encode_u64(new));
+            *tso_limit = Some(new);
+            Ok(Response::Done)
+        }
+    })
+}
+
+/// Serve a read whose ReadIndex has been applied.
+fn serve_read<F: Fs>(
+    db: &Db<F>,
+    d: &RangeDescriptor,
+    req: Request,
+    fault: MvccFault,
+) -> Result<std::result::Result<Response, KvError>> {
+    let ov = Overlay::new(db);
+    // Clamp a scan to this range; the client continues in the next.
+    let clamp = |end: Vec<u8>| {
+        let clamped = !d.end.is_empty() && (end.is_empty() || d.end < end);
+        let stop = if clamped { d.end.clone() } else { end };
+        (stop, clamped.then(|| d.end.clone()))
+    };
+    Ok(match req {
+        Request::Get { key } => Ok(Response::Value(db.get(&keys::raw_key(&key))?)),
+        Request::Scan { start, end, limit } => {
+            let (stop, resume) = clamp(end);
+            let (lo, hi) = keys::data_span(&start, &stop);
+            let mut rows = Vec::new();
+            for row in db.range(&lo, Some(&hi)) {
+                let (k, v) = row?;
+                if let Some((user, keys::CF_RAW, _)) = keys::decode_data_key(&k) {
+                    rows.push((user, v));
+                    if rows.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            Ok(Response::Rows { rows, resume })
+        }
+        Request::MvccGet { key, ts } => mvcc::get(&ov, &key, ts, fault)?
+            .map(Response::Value)
+            .map_err(KvError::Locked),
+        Request::MvccScan {
+            start,
+            end,
+            ts,
+            limit,
+        } => {
+            let (stop, resume) = clamp(end);
+            match mvcc::scan(&ov, &start, &stop, ts, limit, fault)? {
+                Ok(rows) => {
+                    // Stopped early at the limit: resume after the last row.
+                    let resume = if rows.len() >= limit {
+                        rows.last().map(|(k, _)| {
+                            let mut next = k.clone();
+                            next.push(0);
+                            next
+                        })
+                    } else {
+                        resume
+                    };
+                    Ok(Response::Rows { rows, resume })
+                }
+                Err(l) => Err(KvError::Locked(l)),
+            }
+        }
+        Request::ValidateRead {
+            key,
+            start_ts,
+            commit_ts,
+        } => mvcc::validate_read(&ov, &key, start_ts, commit_ts)?
+            .map(|_| Response::Done)
+            .map_err(mvcc_error),
+        Request::ValidateScan {
+            start,
+            end,
+            start_ts,
+            commit_ts,
+        } => {
+            let (stop, resume) = clamp(end);
+            match mvcc::validate_range(&ov, &start, &stop, start_ts, commit_ts)? {
+                Ok(()) => Ok(Response::Rows {
+                    rows: Vec::new(),
+                    resume,
+                }),
+                Err(e) => Err(mvcc_error(e)),
+            }
+        }
+        _ => Err(KvError::Busy),
+    })
 }
 
 impl Replica {
@@ -1009,6 +1313,9 @@ impl Replica {
             reads: BTreeMap::new(),
             ready_reads: Vec::new(),
             removed: false,
+            tso: None,
+            tso_waiting: Vec::new(),
+            tso_extending: false,
         }
     }
 }

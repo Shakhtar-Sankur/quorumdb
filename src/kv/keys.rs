@@ -1,7 +1,9 @@
 //! How a node lays out everything in its one storage engine.
 //!
 //! ```text
-//! d <user key>                       user data (ranges own disjoint spans of it)
+//! d <escaped user key> 00 01 r                  raw value (the plain KV interface)
+//! d <escaped user key> 00 01 l                  MVCC lock of an in-flight transaction
+//! d <escaped user key> 00 01 w <!commit_ts BE>  MVCC write record, newest first
 //! r <range id: u64 BE> h             Raft hard state: term, vote, commit
 //! r <range id: u64 BE> t             truncated log prefix: index, term, voters
 //! r <range id: u64 BE> l <index BE>  Raft log entry
@@ -44,24 +46,113 @@ pub fn incarnation_of(replica: ReplicaId) -> u64 {
 pub const DATA: u8 = b'd';
 pub const LOCAL: u8 = b'r';
 
-pub fn data_key(user_key: &[u8]) -> Vec<u8> {
-    let mut k = Vec::with_capacity(user_key.len() + 1);
+// ─── User data ─────────────────────────────────────────────────────────
+//
+// A user key is escaped (0x00 becomes 0x00 0xFF) and terminated by
+// 0x00 0x01, which keeps every version of every key in user-key order and
+// lets a range's span be expressed on escaped prefixes alone.
+
+pub const CF_RAW: u8 = b'r';
+pub const CF_LOCK: u8 = b'l';
+pub const CF_WRITE: u8 = b'w';
+
+fn escape_into(out: &mut Vec<u8>, key: &[u8]) {
+    for &b in key {
+        if b == 0 {
+            out.extend_from_slice(&[0, 0xFF]);
+        } else {
+            out.push(b);
+        }
+    }
+}
+
+fn key_prefix(user_key: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(user_key.len() + 4);
     k.push(DATA);
-    k.extend_from_slice(user_key);
+    escape_into(&mut k, user_key);
+    k.extend_from_slice(&[0, 1]);
     k
 }
 
-pub fn user_key(data_key: &[u8]) -> &[u8] {
-    &data_key[1..]
+/// The engine key of a user key's raw (non-transactional) value.
+pub fn raw_key(user_key: &[u8]) -> Vec<u8> {
+    let mut k = key_prefix(user_key);
+    k.push(CF_RAW);
+    k
 }
 
-/// The storage-engine span `[start, end)` holding a range's user data.
+pub fn lock_key(user_key: &[u8]) -> Vec<u8> {
+    let mut k = key_prefix(user_key);
+    k.push(CF_LOCK);
+    k
+}
+
+/// Write records sort newest first: the timestamp is stored inverted.
+pub fn write_key(user_key: &[u8], commit_ts: u64) -> Vec<u8> {
+    let mut k = key_prefix(user_key);
+    k.push(CF_WRITE);
+    k.extend_from_slice(&(!commit_ts).to_be_bytes());
+    k
+}
+
+/// The span of every write record of `user_key` at or below `ts`.
+pub fn writes_at_or_below(user_key: &[u8], ts: u64) -> (Vec<u8>, Vec<u8>) {
+    let lo = write_key(user_key, ts);
+    let mut hi = key_prefix(user_key);
+    hi.push(CF_WRITE + 1);
+    (lo, hi)
+}
+
+/// Split an engine data key into `(user key, column family, timestamp)`.
+pub fn decode_data_key(key: &[u8]) -> Option<(Vec<u8>, u8, Option<u64>)> {
+    if key.first() != Some(&DATA) {
+        return None;
+    }
+    let mut user = Vec::new();
+    let mut i = 1;
+    loop {
+        match (key.get(i)?, key.get(i + 1)) {
+            (0, Some(0xFF)) => {
+                user.push(0);
+                i += 2;
+            }
+            (0, Some(1)) => {
+                i += 2;
+                break;
+            }
+            (0, _) => return None,
+            (&b, _) => {
+                user.push(b);
+                i += 1;
+            }
+        }
+    }
+    let cf = *key.get(i)?;
+    let ts = match key.get(i + 1..) {
+        Some(rest) if rest.len() == 8 => Some(!u64::from_be_bytes(rest.try_into().ok()?)),
+        _ => None,
+    };
+    Some((user, cf, ts))
+}
+
+/// The user key of an engine data key.
+pub fn user_key(data_key: &[u8]) -> Vec<u8> {
+    decode_data_key(data_key)
+        .map(|(k, _, _)| k)
+        .unwrap_or_default()
+}
+
+/// The storage-engine span holding every version of every user key in
+/// `[start, end)` (`end` empty: unbounded).
 pub fn data_span(start: &[u8], end: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let lo = data_key(start);
+    let mut lo = vec![DATA];
+    escape_into(&mut lo, start);
     let hi = if end.is_empty() {
         vec![DATA + 1]
     } else {
-        data_key(end)
+        let mut hi = vec![DATA];
+        escape_into(&mut hi, end);
+        hi
     };
     (lo, hi)
 }
@@ -350,6 +441,49 @@ mod tests {
         );
         let (lo, hi) = log_span(2, 10);
         assert!(log_key(2, 10) >= lo && log_key(2, u64::MAX) < hi && truncated_key(2) >= hi);
+    }
+
+    #[test]
+    fn data_keys_keep_user_key_order_and_round_trip() {
+        let users: Vec<&[u8]> = vec![
+            b"",
+            b"\x00",
+            b"\x00\x00",
+            b"\x00\x01",
+            b"a",
+            b"a\x00",
+            b"ab",
+            b"b",
+        ];
+        // Every engine key of a smaller user key sorts before every engine
+        // key of a larger one.
+        for w in users.windows(2) {
+            let top = [raw_key(w[0]), lock_key(w[0]), write_key(w[0], 0)]
+                .into_iter()
+                .max()
+                .unwrap();
+            let bottom = [raw_key(w[1]), lock_key(w[1]), write_key(w[1], u64::MAX)]
+                .into_iter()
+                .min()
+                .unwrap();
+            assert!(top < bottom, "{:?} vs {:?}", w[0], w[1]);
+        }
+        for u in &users {
+            assert_eq!(
+                decode_data_key(&write_key(u, 42)),
+                Some((u.to_vec(), CF_WRITE, Some(42)))
+            );
+            assert_eq!(
+                decode_data_key(&lock_key(u)),
+                Some((u.to_vec(), CF_LOCK, None))
+            );
+            let (lo, hi) = data_span(u, b"b");
+            if *u < &b"b"[..] {
+                assert!(raw_key(u) >= lo && raw_key(u) < hi);
+            }
+        }
+        // Newer write records sort first.
+        assert!(write_key(b"k", 9) < write_key(b"k", 8));
     }
 
     #[test]

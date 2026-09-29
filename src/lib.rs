@@ -12,7 +12,9 @@ pub mod error;
 pub mod kv;
 pub mod raft;
 pub mod rng;
+pub mod runtime;
 pub mod storage;
+pub mod txn;
 
 pub use error::{Error, Result};
 pub use storage::engine::{self, Db, Options, Stats, SyncMode};

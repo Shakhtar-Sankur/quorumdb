@@ -81,6 +81,23 @@ jobs:
             fi
           done
 
+  transactions:
+    name: transaction simulation, 200 clusters
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: ./target/release/quorumdb txn-sim --seeds 200
+      - name: every planted transaction bug is caught
+        run: |
+          for fault in skip-write-conflict read-ignores-locks skip-read-validation tso-serve-before-durable; do
+            if ./target/release/quorumdb txn-sim --seeds 200 --fault "$fault"; then
+              echo "planted bug $fault was not caught" >&2
+              exit 1
+            fi
+          done
+
   bench:
     name: benchmark
     runs-on: ubuntu-latest
