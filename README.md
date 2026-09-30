@@ -12,11 +12,13 @@ FoundationDB is tested: deterministic simulation, where a single seed
 reproduces an entire run of random work, random crashes and random disk
 failures, exactly.
 
-**Status: milestones 1 to 6 of 8 are complete: a distributed SQL database
-that `psql` connects to, on a sharded multi-Raft store that splits and
+**Status: all 8 milestones are complete: a distributed SQL database that
+`psql` connects to, on a sharded multi-Raft store that splits and
 rebalances itself, with serializable ACID transactions and a crash-safe
-LSM storage engine, every layer machine-checked by deterministic
-simulation.**
+LSM storage engine; every layer machine-checked by deterministic
+simulation, the transaction protocol model-checked in TLA+, a
+TPC-C-derived benchmark, and a time-travel debugger that replays any
+simulated cluster event by event.**
 
 ```
 $ quorumdb server ./data            # three nodes, one process, three directories
@@ -41,6 +43,12 @@ quorum=> EXPLAIN SELECT * FROM orders WHERE id >= 11 AND id < 14 AND shipped ORD
 ```
 
 ## The numbers that matter
+
+TPC-C-derived, 60 seconds, one terminal: **1,503 tpmC**, serializable,
+with TPC-C's consistency conditions checked after the run (details under
+[Benchmarks](#benchmarks)). The transaction protocol, model-checked in
+TLA+: **337,749 states**, every invariant holds, and each planted bug is
+found.
 
 Distributed transactions, 300 simulated clusters:
 
@@ -275,6 +283,92 @@ It also found a bug in its own runtime before passing: a waiting task
 re-registered its timeout on every wake-up, so stale timers woke it again
 and multiplied, three million spurious wake-ups in ten simulated seconds.
 
+## A TLA+ model of the transaction protocol
+
+`spec/Percolator.tla` models the protocol in `src/txn` at the level of
+single-key atomic steps, which is what a Raft-replicated range provides:
+begin at an oracle timestamp, snapshot reads that wait on locks, prewrite
+with first-committer-wins and rollback fences, commit timestamps, read
+validation, the primary key as the single commit point, and other
+transactions rolling forward or back the locks they meet, including
+rolling back a transaction that is merely slow once its lock expires.
+TLC checks every reachable state against four invariants:
+
+- **Atomicity:** no write of a transaction that did not commit, and no
+  rolled-back key of one that did.
+- **First committer wins:** two committed transactions that wrote the same
+  key never overlapped in time (no lost updates).
+- **Snapshot reads:** a committed transaction saw exactly the state
+  committed as of its start timestamp.
+- **Serializable:** every committed transaction's reads are what a serial
+  execution in commit-timestamp order returns.
+
+As with the simulators, a model that never fails proves nothing, so
+`spec/check.sh` runs TLC on the real protocol and on the same three planted
+bugs the transaction simulator plants, and requires each to break exactly
+the invariant that guards against it:
+
+```
+$ TLA2TOOLS=tla2tools.jar spec/check.sh
+ok   Percolator.cfg: every invariant holds (337749 distinct states found)
+ok   BugSkipWriteConflict.cfg: TLC found the planted bug, FirstCommitterWins violated (106613 distinct states found)
+ok   BugReadIgnoresLocks.cfg: TLC found the planted bug, SnapshotReads violated (171592 distinct states found)
+ok   BugSkipReadValidation.cfg: TLC found the planted bug, Serializable violated (131601 distinct states found)
+```
+
+Without read validation, TLC's counterexample is write skew in 14 steps:
+T1 writes `k1`; T2 reads `k1` (nothing yet), writes `k2`, and commits
+after T1 without noticing that T1 changed what it read. The model covers
+two transactions on two keys, exhaustively; timestamp-oracle failover and
+range scans are left to the simulator, which checks them against real
+code.
+
+## A time-travel debugger
+
+Every simulator failure prints a seed, and a seed is a complete recording:
+the run is deterministic. `quorumdb debug` turns that into a debugger for
+the Raft simulator. It steps one event at a time (a message delivered, a
+clock tick, a crash, a partition), shows what each event changed, and
+steps *backward* by replaying the seed to an earlier event, which takes
+milliseconds. Breakpoints stop on a new leader, a crash, a partition, a
+commit, a term, a node, or a time.
+
+The planted Figure 8 bug, from the failure to its cause:
+
+```
+$ quorumdb debug --seed 1160 --fault commit-old-term
+(qdb) continue
+...
+#4332   t= 3564ms  deliver n1 -> n2 (term 7): vote granted
+                 * n2: Candidate -> Leader (term 7)
+VIOLATION after #4342: seed 1160, t=3573ms: state machine safety: node 2 applied "(empty)" at index 36, another node applied "cmd-35"
+(`trace 30` shows how it happened; `back N` rewinds)
+(qdb) back 40
+back at #4302 t=3542ms
+#4302   t= 3542ms  tick n5
+(qdb) state
+#4302 t=3542ms
+  node  status      role          term  vote  leader  commit  applied  log (index/term)  voters
+  n1    up          PreCandidate     6    n3       -      67       67          62..69/1  [1, 2, 3]
+  n2    up          PreCandidate     6     -       -      31       31          30..50/5  [1, 2, 3]
+  n3    up          Follower         6    n3       -      67       67         62..203/6  [1, 2, 3]
+...
+```
+
+The trace shows the cause. At event #3200, n3, leader in term 6, commits
+indexes 36 and 37 because n1 also holds them, though they are entries from
+term 1: counting replicas of an old-term entry, which Raft forbids (the
+Figure 8 rule). n2 holds different entries there, from term 2, and its log
+ends in term 5, while n1's ends in term 1; so in term 7 n1 votes for n2,
+which overwrites the committed entries. `log 2` and `log 3` show the two
+logs at any point in time.
+
+`--html` writes the whole run as one self-contained page: a lane per node
+showing its role over time, crashes and partitions, and a scrubber over
+every event that changed something.
+
+![The Raft timeline for the planted Figure 8 bug](docs/debugger.png)
+
 ## SQL, over the PostgreSQL wire protocol
 
 `src/sql` and `src/server` put a SQL database on top of the transactions:
@@ -308,6 +402,71 @@ starting total. CI also starts the real server, runs a session through
 `psql`, restarts the server, and checks the data survived.
 
 ## Benchmarks
+
+### TPC-C-derived: the whole database under an order-processing workload
+
+`quorumdb tpcc` loads a TPC-C database through SQL and runs terminals
+against a three-node cluster on real disks, each executing the five TPC-C
+transactions (New-Order, Payment, Order-Status, Delivery, Stock-Level) in
+the standard mix (45/43/4/4/4) as **serializable** transactions, retrying
+the ones that lose a conflict. Each terminal is bound to a home warehouse
+and district, as TPC-C prescribes. The metric is tpmC, New-Orders
+committed per minute. After the run it checks TPC-C's consistency
+conditions 1 and 2 (the warehouse's year-to-date total equals the sum of
+its districts'; each district's next order id follows its newest order),
+which hold only if every transaction was atomic and isolated. CI runs it
+on every push.
+
+60-second runs, 3 nodes in one process, on a 4-core cloud container:
+
+| Terminals | Warehouses | tpmC | New-Order p50 / p99 | Payment p50 / p99 | Conflicts retried | Consistency |
+|---|---|---|---|---|---|---|
+| 1 | 1 | **1,503** | 18 / 284 ms | 9 / 55 ms | 0 | holds |
+| 10 | 1 | **1,129** | 173 / 1,418 ms | 32 / 704 ms | 1,219 | holds |
+| 20 | 2 | **892** | 341 / 4,556 ms | 57 / 1,421 ms | 1,104 | holds |
+
+No transaction was abandoned and none failed with an error in any run.
+
+**It is not an audited TPC-C result**, and it differs from the
+specification in ways that matter for comparison:
+
+- The item table and initial order history are scaled down (10,000 items,
+  not 100,000; 10 initial orders per district, not 3,000). Customers are
+  at full scale, 3,000 per district.
+- Customers are chosen by id, uniformly: no last-name lookups, no NURand
+  skew, no remote-warehouse payments or order lines.
+- Composite keys are flattened into one integer, since quorumdb has
+  single-column primary keys; hot columns (year-to-date totals, the next
+  order id, a customer's balance) live in their own tables, the way
+  CockroachDB's TPC-C uses column families.
+- Terminals run with no keying or think time, so a warehouse sees far more
+  load than TPC-C's cap of about 12.9 tpmC per warehouse allows.
+
+What the numbers say, honestly: more terminals do not buy throughput here.
+All three nodes and every client run in one process on one thread, and
+profiling shows it busy waiting on fsync and running Raft rounds, so
+throughput is capped at the same number of statements per second whatever
+the concurrency; more terminals only add queueing and conflicts. The
+conflicts are real contention under optimistic concurrency: every Payment
+updates its warehouse's year-to-date total, and Delivery, a long
+transaction over all ten districts, collides with Payments on customer
+balances. A system like CockroachDB would queue such writers behind locks
+instead of aborting them. Nodes on separate machines, and
+pessimistic locking for hot rows, are the next steps.
+
+Profiling the benchmark drove real fixes, taking 10 terminals from about
+400 tpmC (on a smaller customer table) to over 1,100:
+
+- `LIMIT` pushed into ordered primary-key scans, so Delivery reads (and
+  validates) one row per district instead of the whole range, and stops
+  conflicting with every concurrent New-Order.
+- MVCC version reads made lazy: a hot row's read stops at its newest
+  visible version instead of loading its whole history.
+- A block cache and prefix bloom filters in the storage engine (below).
+- Lock-wait backoff that starts at 1 ms instead of 10 to 50, a client-side
+  cache of range leaders, and a parallel bulk loader.
+
+### Storage engine
 
 One million keys with 100-byte values, default options, on a 4-core cloud
 container. Numbers are from `quorumdb bench`, which CI also runs on every
@@ -353,6 +512,13 @@ L2: 49 tables, 104011674 bytes
   overlaps.
 - **Streaming k-way merge.** Scans and compactions hold one block per table
   in memory, never a whole table.
+- **A block cache.** A shared, size-bounded LRU cache of decoded blocks
+  serves repeated reads without touching the disk or re-parsing.
+- **Prefix bloom filters.** Optionally, each key's prefix is also added to
+  its table's filter (a table so built has its own magic number, so older
+  tables stay readable). The transaction layer uses it for version reads,
+  which are range scans: a table that holds no version of the key is
+  skipped without reading a block.
 - **Atomic write batches and range scans.** A batch is one log record,
   recovered entirely or not at all; scans seek past every table and block
   that ends before the start key.
@@ -392,9 +558,13 @@ cargo run --release -- txn-sim --seeds 50     # the distributed transaction simu
 cargo run --release -- bench ./bench-db  # benchmarks on a real, empty directory
 cargo run --release -- server ./data     # a SQL server; then: psql -h 127.0.0.1 -U quorum
 cargo run --release -- shell ./data      # a storage-engine shell: put, get, del, scan, levels
+cargo run --release -- tpcc ./tpcc --terminals 10 --seconds 60   # the TPC-C-derived benchmark
+cargo run --release -- debug --seed 1160 --fault commit-old-term # the time-travel debugger
+TLA2TOOLS=path/to/tla2tools.jar spec/check.sh                    # TLC on the TLA+ model
 ```
 
-A failing seed prints the command that replays it exactly.
+A failing seed prints the command that replays it exactly, and for the
+Raft simulator the command that opens it in the debugger.
 
 ## Roadmap
 
@@ -406,8 +576,8 @@ A failing seed prints the command that replays it exactly.
 | 4 | Multi-Raft: replicas on the storage engine, range sharding, automatic splits and rebalancing | done |
 | 5 | Distributed transactions: snapshot isolation, then serializable | done |
 | 6 | SQL: parser, planner, executor, Postgres wire protocol | done |
-| 7 | TLA+ model of the transaction protocol; TPC-C benchmarks | next |
-| 8 | A time-travel debugger: replay any seed and step through the cluster | |
+| 7 | TLA+ model of the transaction protocol; TPC-C benchmarks | done |
+| 8 | A time-travel debugger: replay any seed and step through the cluster | done |
 
 ## Honest limits today
 
@@ -419,10 +589,17 @@ A failing seed prints the command that replays it exactly.
   ranges split but never merge.
 - Old MVCC versions are never garbage-collected, and a long transaction's
   locks have no heartbeat to extend their time-to-live.
+- Concurrency control is optimistic: a writer that loses a conflict aborts
+  and retries rather than waiting in a lock queue, which is what limits
+  the TPC-C runs on hot rows.
+- The TLA+ model is checked exhaustively for two transactions on two keys;
+  larger configurations are left to the simulator.
+- The time-travel debugger drives the Raft simulator; the cluster and
+  transaction simulators replay by seed but cannot yet be stepped.
 - Snapshots are sent as one message, which suits the simulator's small
   ranges but not multi-gigabyte ones.
 - Compaction runs inline on the writing thread, so a write that triggers it
-  waits for it. There is no block cache yet; reads rely on the OS page cache.
+  waits for it.
 - The simulator models power loss and torn writes. It does not yet model
   disks that lie about syncs, or silent corruption of already-synced data.
 
