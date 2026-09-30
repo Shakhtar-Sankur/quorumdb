@@ -95,6 +95,32 @@ pub fn write_key(user_key: &[u8], commit_ts: u64) -> Vec<u8> {
     k
 }
 
+/// The bloom prefix of every write record of `user_key`: the engine key
+/// without its timestamp.
+pub fn write_prefix(user_key: &[u8]) -> Vec<u8> {
+    let mut k = key_prefix(user_key);
+    k.push(CF_WRITE);
+    k
+}
+
+/// The engine's bloom prefix extractor: a write record's key minus its
+/// timestamp, so reading a key's versions skips tables that have none.
+pub fn bloom_prefix_len(key: &[u8]) -> Option<usize> {
+    if key.first() != Some(&DATA) {
+        return None;
+    }
+    let mut i = 1;
+    loop {
+        match (key.get(i)?, key.get(i + 1)?) {
+            (0, 1) => break,
+            (0, _) => i += 2,
+            _ => i += 1,
+        }
+    }
+    let cf = i + 2;
+    (key.get(cf) == Some(&CF_WRITE) && key.len() == cf + 1 + 8).then_some(cf + 1)
+}
+
 /// The span of every write record of `user_key` at or below `ts`.
 pub fn writes_at_or_below(user_key: &[u8], ts: u64) -> (Vec<u8>, Vec<u8>) {
     let lo = write_key(user_key, ts);
@@ -416,6 +442,21 @@ pub fn decode_entry(data: &[u8]) -> Option<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bloom_prefix_is_a_write_key_without_its_timestamp() {
+        for user in [&b"k"[..], b"", b"a\x00b", b"\x00\x01"] {
+            let prefix = write_prefix(user);
+            let key = write_key(user, 42);
+            assert_eq!(bloom_prefix_len(&key), Some(prefix.len()));
+            assert!(key.starts_with(&prefix));
+            let (lo, hi) = writes_at_or_below(user, 99);
+            assert!(lo.starts_with(&prefix) && hi > key);
+            assert_eq!(bloom_prefix_len(&lock_key(user)), None);
+            assert_eq!(bloom_prefix_len(&raw_key(user)), None);
+        }
+        assert_eq!(bloom_prefix_len(b"x"), None);
+    }
 
     #[test]
     fn local_keys_sort_by_range_then_kind_then_index() {

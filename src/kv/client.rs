@@ -64,13 +64,22 @@ impl KvClient {
                     if !req.is_idempotent() {
                         return Err(CallError::Unknown);
                     }
+                    self.io.learn_leader(desc.id, None);
                     sent_once = true;
                     hint = None;
                 }
-                Some(Ok(resp)) => return Ok(resp),
+                Some(Ok(resp)) => {
+                    self.io.learn_leader(desc.id, Some(node));
+                    return Ok(resp);
+                }
                 Some(Err(KvError::NotLeader(h))) => {
+                    self.io.learn_leader(desc.id, h);
                     hint = h;
-                    self.io.sleep(2 + self.io.rand(10)).await;
+                    // A known new leader: go straight there. No leader yet
+                    // (an election): give it a moment.
+                    if h.is_none() {
+                        self.io.sleep(2 + self.io.rand(10)).await;
+                    }
                 }
                 Some(Err(
                     KvError::KeyNotInRange

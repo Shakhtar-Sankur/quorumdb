@@ -79,6 +79,35 @@ impl Executor {
     }
 }
 
+/// Run futures concurrently and collect their outputs in order: what the
+/// client uses to send many requests in one round trip.
+pub async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = (0..futures.len()).map(|_| None).collect();
+    std::future::poll_fn(move |cx| {
+        let mut pending = false;
+        for (f, out) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if out.is_none() {
+                match f.as_mut().poll(cx) {
+                    Poll::Ready(v) => *out = Some(v),
+                    Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(
+                outputs
+                    .iter_mut()
+                    .map(|o| o.take().expect("ready"))
+                    .collect(),
+            )
+        }
+    })
+    .await
+}
+
 /// Where a request should go.
 pub type Route = (RangeDescriptor, Option<NodeId>);
 
@@ -101,6 +130,9 @@ struct IoState {
 pub struct Io {
     state: RefCell<IoState>,
     router: Router,
+    /// The leader each range last answered from: a client-side cache, far
+    /// fresher than the placement driver's periodic view.
+    leaders: RefCell<BTreeMap<RangeId, NodeId>>,
 }
 
 impl Io {
@@ -111,6 +143,7 @@ impl Io {
                 ..IoState::default()
             }),
             router: Box::new(router),
+            leaders: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -128,7 +161,23 @@ impl Io {
     }
 
     pub fn route(&self, key: &[u8]) -> Option<Route> {
-        (self.router)(key)
+        let (desc, pd_leader) = (self.router)(key)?;
+        let cached = self.leaders.borrow().get(&desc.id).copied();
+        let leader = cached.filter(|n| desc.nodes().contains(n)).or(pd_leader);
+        Some((desc, leader))
+    }
+
+    /// Remember (or forget, with `None`) which node leads a range.
+    pub fn learn_leader(&self, range: RangeId, leader: Option<NodeId>) {
+        let mut l = self.leaders.borrow_mut();
+        match leader {
+            Some(n) => {
+                l.insert(range, n);
+            }
+            None => {
+                l.remove(&range);
+            }
+        }
     }
 
     /// Queue a request for the driver to deliver.

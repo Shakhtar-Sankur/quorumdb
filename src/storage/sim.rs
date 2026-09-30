@@ -76,6 +76,9 @@ pub fn run(seed: u64, steps: usize, fault: Fault) -> Result<Report, String> {
         level1_bytes: 128 + rng.below(1024),
         level_multiplier: 2 + rng.below(3),
         bloom_bits_per_key: rng.below(13) as usize,
+        // Odd seeds read through a tiny, constantly evicting cache.
+        block_cache_bytes: if seed % 2 == 1 { 1024 } else { 0 },
+        bloom_prefix: None,
         fault,
     };
     let fail =

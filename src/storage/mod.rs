@@ -3,6 +3,7 @@
 //! the crash simulator that tests it.
 
 pub mod bloom;
+pub mod cache;
 pub mod engine;
 pub mod fs;
 pub mod manifest;

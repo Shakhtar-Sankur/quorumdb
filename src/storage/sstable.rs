@@ -17,13 +17,23 @@
 //! checksummed, and a table is synced before any manifest names it, so a
 //! checksum failure here is real corruption, never an expected crash artefact.
 
+use std::sync::Arc;
+
 use crate::codec::{Reader, put_bytes, put_u32, put_u64};
 use crate::crc::crc32;
 use crate::error::{Error, Result};
 use crate::storage::bloom::{self, Bloom};
+use crate::storage::cache::BlockCache;
 use crate::storage::fs::Fs;
 
 const MAGIC: &[u8; 8] = b"QDBSST02";
+/// A table whose bloom filter also holds each key's prefix. Many bits away
+/// from `MAGIC`, so no single bit flip turns one into the other.
+const MAGIC_PREFIXED: &[u8; 8] = b"QDBPSST1";
+
+/// Where a key's bloom prefix ends, for keys that have one. Tables built
+/// with it can rule themselves out of a scan confined to one prefix.
+pub type PrefixFn = fn(&[u8]) -> Option<usize>;
 const FOOTER: u64 = 44;
 
 /// A key and its value, or `None` for a tombstone.
@@ -92,6 +102,8 @@ pub struct TableBuilder {
     index: Vec<BlockHandle>,
     hashes: Vec<u64>,
     count: u64,
+    prefix: Option<PrefixFn>,
+    last_prefix: Option<Vec<u8>>,
 }
 
 impl TableBuilder {
@@ -106,7 +118,15 @@ impl TableBuilder {
             index: Vec::new(),
             hashes: Vec::new(),
             count: 0,
+            prefix: None,
+            last_prefix: None,
         }
+    }
+
+    /// Also add each key's prefix, as `prefix` finds it, to the filter.
+    pub fn with_prefix(mut self, prefix: Option<PrefixFn>) -> Self {
+        self.prefix = prefix;
+        self
     }
 
     pub fn add(&mut self, key: &[u8], value: Option<&[u8]>) {
@@ -120,6 +140,13 @@ impl TableBuilder {
         put_entry(&mut self.block, key, value);
         self.block_last = key.to_vec();
         self.hashes.push(bloom::hash(key));
+        if let Some(n) = self.prefix.and_then(|f| f(key)) {
+            let p = &key[..n];
+            if self.last_prefix.as_deref() != Some(p) {
+                self.hashes.push(bloom::hash(p));
+                self.last_prefix = Some(p.to_vec());
+            }
+        }
         self.count += 1;
         if self.block.len() >= self.block_bytes {
             self.finish_block();
@@ -179,7 +206,11 @@ impl TableBuilder {
         put_u64(&mut self.out, self.count);
         let meta_crc = crc32(&self.out[bloom_off as usize..]);
         put_u32(&mut self.out, meta_crc);
-        self.out.extend_from_slice(MAGIC);
+        self.out.extend_from_slice(if self.prefix.is_some() {
+            MAGIC_PREFIXED
+        } else {
+            MAGIC
+        });
         self.out
     }
 }
@@ -192,6 +223,9 @@ pub struct Table {
     pub entries: u64,
     index: Vec<BlockHandle>,
     bloom: Bloom,
+    /// Whether the bloom filter holds key prefixes too.
+    prefixed: bool,
+    cache: Option<Arc<BlockCache>>,
 }
 
 impl Table {
@@ -202,9 +236,11 @@ impl Table {
             return Err(corrupt("shorter than a footer"));
         }
         let footer = fs.read_at(&name, size - FOOTER, FOOTER as usize)?;
-        if &footer[36..] != MAGIC {
-            return Err(corrupt("bad magic"));
-        }
+        let prefixed = match &footer[36..] {
+            m if m == MAGIC => false,
+            m if m == MAGIC_PREFIXED => true,
+            _ => return Err(corrupt("bad magic")),
+        };
         let mut r = Reader::new(&footer[..36]);
         let fields = (|| Some((r.u64()?, r.u32()?, r.u64()?, r.u32()?, r.u64()?, r.u32()?)))();
         let (bloom_off, bloom_len, index_off, index_len, entries, meta_crc) =
@@ -253,7 +289,15 @@ impl Table {
             entries,
             index,
             bloom,
+            prefixed,
+            cache: None,
         })
+    }
+
+    /// Serve blocks through `cache`, shared with the database's other tables.
+    pub fn with_cache(mut self, cache: Arc<BlockCache>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     pub fn smallest(&self) -> &[u8] {
@@ -272,35 +316,44 @@ impl Table {
         self.bloom.may_contain(key)
     }
 
+    /// Whether any key with this bloom prefix may be here.
+    pub fn may_contain_prefix(&self, prefix: &[u8]) -> bool {
+        !self.prefixed || self.bloom.may_contain(prefix)
+    }
+
     /// `Some(None)` is a tombstone; `None` means this table knows nothing
     /// about `key`. Does not consult the bloom filter; callers do.
     pub fn get<F: Fs>(&self, fs: &F, key: &[u8]) -> Result<Option<Option<Vec<u8>>>> {
         let i = self.index.partition_point(|h| h.last.as_slice() < key);
         match self.index.get(i) {
             Some(h) if h.first.as_slice() <= key => {
-                let data = self.read_block(fs, i)?;
-                let entries = parse_block(&data).map_err(|why| self.corrupt_block(i, why))?;
+                let entries = self.entries(fs, i)?;
                 Ok(entries
-                    .binary_search_by(|(k, _)| (*k).cmp(key))
+                    .binary_search_by(|(k, _)| k.as_slice().cmp(key))
                     .ok()
-                    .map(|j| entries[j].1.map(<[u8]>::to_vec)))
+                    .map(|j| entries[j].1.clone()))
             }
             _ => Ok(None),
         }
     }
 
-    fn read_block<F: Fs>(&self, fs: &F, i: usize) -> Result<Vec<u8>> {
+    /// Block `i`'s entries, from the cache if it holds them.
+    fn entries<F: Fs>(&self, fs: &F, i: usize) -> Result<Arc<Vec<Entry>>> {
+        if let Some(entries) = self.cache.as_ref().and_then(|c| c.get((self.id, i))) {
+            return Ok(entries);
+        }
         let h = &self.index[i];
-        Ok(fs.read_at(&self.name, h.offset, h.len as usize)?)
-    }
-
-    fn read_entries<F: Fs>(&self, fs: &F, i: usize) -> Result<Vec<Entry>> {
-        let data = self.read_block(fs, i)?;
-        let entries = parse_block(&data).map_err(|why| self.corrupt_block(i, why))?;
-        Ok(entries
+        let data = fs.read_at(&self.name, h.offset, h.len as usize)?;
+        let entries: Vec<Entry> = parse_block(&data)
+            .map_err(|why| self.corrupt_block(i, why))?
             .into_iter()
             .map(|(k, v)| (k.to_vec(), v.map(<[u8]>::to_vec)))
-            .collect())
+            .collect();
+        let entries = Arc::new(entries);
+        if let Some(c) = &self.cache {
+            c.insert((self.id, i), entries.clone(), h.len as usize);
+        }
+        Ok(entries)
     }
 
     fn corrupt_block(&self, i: usize, why: &str) -> Error {
@@ -313,25 +366,24 @@ impl Table {
             table: self,
             fs,
             next_block: 0,
-            buf: Vec::new().into_iter(),
+            buf: Arc::new(Vec::new()),
+            pos: 0,
+            seek: None,
         }
     }
 
     /// Entries with keys at or after `start`, skipping every block that
     /// ends before it.
-    pub fn iter_from<'a, F: Fs>(
-        &'a self,
-        fs: &'a F,
-        start: &'a [u8],
-    ) -> impl Iterator<Item = Result<Entry>> + 'a {
+    pub fn iter_from<'a, F: Fs>(&'a self, fs: &'a F, start: &'a [u8]) -> TableIter<'a, F> {
         let first = self.index.partition_point(|h| h.last.as_slice() < start);
-        let it = TableIter {
+        TableIter {
             table: self,
             fs,
             next_block: first,
-            buf: Vec::new().into_iter(),
-        };
-        it.skip_while(move |e| matches!(e, Ok((k, _)) if k.as_slice() < start))
+            buf: Arc::new(Vec::new()),
+            pos: 0,
+            seek: Some(start),
+        }
     }
 }
 
@@ -339,7 +391,10 @@ pub struct TableIter<'a, F: Fs> {
     table: &'a Table,
     fs: &'a F,
     next_block: usize,
-    buf: std::vec::IntoIter<Entry>,
+    buf: Arc<Vec<Entry>>,
+    pos: usize,
+    /// Skip entries before this key in the first block read.
+    seek: Option<&'a [u8]>,
 }
 
 impl<F: Fs> Iterator for TableIter<'_, F> {
@@ -347,16 +402,23 @@ impl<F: Fs> Iterator for TableIter<'_, F> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(entry) = self.buf.next() {
-                return Some(Ok(entry));
+            if let Some(entry) = self.buf.get(self.pos) {
+                self.pos += 1;
+                return Some(Ok(entry.clone()));
             }
             if self.next_block >= self.table.index.len() {
                 return None;
             }
-            let block = self.table.read_entries(self.fs, self.next_block);
+            let block = self.table.entries(self.fs, self.next_block);
             self.next_block += 1;
             match block {
-                Ok(entries) => self.buf = entries.into_iter(),
+                Ok(entries) => {
+                    self.pos = match self.seek.take() {
+                        Some(start) => entries.partition_point(|(k, _)| k.as_slice() < start),
+                        None => 0,
+                    };
+                    self.buf = entries;
+                }
                 Err(e) => {
                     self.next_block = self.table.index.len();
                     return Some(Err(e));

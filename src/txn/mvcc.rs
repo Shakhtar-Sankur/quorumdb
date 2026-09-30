@@ -16,6 +16,7 @@
 //! first learn its fate.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use crate::codec::{Reader, put_bytes, put_u64};
 use crate::error::Result;
@@ -179,20 +180,65 @@ impl<'a, F: Fs> Overlay<'a, F> {
         }
     }
 
-    /// Keys in `[lo, hi)`, merging pending writes over the engine.
-    pub fn scan(&self, lo: &[u8], hi: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        for row in self.db.range(lo, Some(hi)) {
-            let (k, v) = row?;
-            merged.insert(k, v);
-        }
-        for (k, v) in self.pending.range(lo.to_vec()..hi.to_vec()) {
-            match v {
-                Some(v) => merged.insert(k.clone(), v.clone()),
-                None => merged.remove(k),
-            };
-        }
-        Ok(merged.into_iter().collect())
+    /// Keys in `[lo, hi)` in order, merging pending writes over the
+    /// engine. Lazy: a caller that stops early reads no further.
+    pub fn iter<'b>(
+        &'b self,
+        lo: &'b [u8],
+        hi: &'b [u8],
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'b {
+        self.merge(self.db.range(lo, Some(hi)), lo, hi)
+    }
+
+    /// `iter` over a span whose keys all have the bloom prefix `prefix`.
+    pub fn iter_in_prefix<'b>(
+        &'b self,
+        prefix: &'b [u8],
+        lo: &'b [u8],
+        hi: &'b [u8],
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'b {
+        self.merge(self.db.range_in_prefix(prefix, lo, hi), lo, hi)
+    }
+
+    fn merge<'b>(
+        &'b self,
+        db: impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'b,
+        lo: &'b [u8],
+        hi: &'b [u8],
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'b {
+        let mut db = db.peekable();
+        let mut pending = self
+            .pending
+            .range::<[u8], _>((Bound::Included(lo), Bound::Excluded(hi)))
+            .peekable();
+        std::iter::from_fn(move || {
+            loop {
+                let from_db = match db.peek() {
+                    Some(Err(_)) => return db.next(),
+                    Some(Ok((k, _))) => Some(k),
+                    None => None,
+                };
+                let take_pending = match (from_db, pending.peek()) {
+                    (None, None) => return None,
+                    (Some(_), None) => false,
+                    (None, Some(_)) => true,
+                    (Some(d), Some((p, _))) => {
+                        if d.as_slice() == p.as_slice() {
+                            db.next(); // shadowed by the pending write
+                            continue;
+                        }
+                        p.as_slice() < d.as_slice()
+                    }
+                };
+                if !take_pending {
+                    return db.next();
+                }
+                let (k, v) = pending.next().expect("peeked");
+                if let Some(v) = v {
+                    return Some(Ok((k.clone(), v.clone())));
+                }
+            }
+        })
     }
 
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
@@ -218,23 +264,27 @@ fn load_lock<F: Fs>(ov: &Overlay<F>, key: &[u8]) -> Result<Option<Lock>> {
     Ok(ov.get(&keys::lock_key(key))?.and_then(|v| Lock::decode(&v)))
 }
 
-/// Write records of `key` with timestamp at or below `ts`, newest first.
-fn writes_below<F: Fs>(ov: &Overlay<F>, key: &[u8], ts: u64) -> Result<Vec<(u64, WriteRecord)>> {
+/// Visit the write records of `key` with timestamp at or below `ts`,
+/// newest first, until `f` returns `Some`. Reads lazily: most callers need
+/// only the newest few records of a long history.
+fn find_write<F: Fs, T>(
+    ov: &Overlay<F>,
+    key: &[u8],
+    ts: u64,
+    mut f: impl FnMut(u64, WriteRecord) -> Option<T>,
+) -> Result<Option<T>> {
     let (lo, hi) = keys::writes_at_or_below(key, ts);
-    let mut out = Vec::new();
-    for (k, v) in ov.scan(&lo, &hi)? {
+    let prefix = keys::write_prefix(key);
+    for row in ov.iter_in_prefix(&prefix, &lo, &hi) {
+        let (k, v) = row?;
         if let (Some((_, keys::CF_WRITE, Some(t))), Some(rec)) =
             (keys::decode_data_key(&k), WriteRecord::decode(&v))
+            && let Some(x) = f(t, rec)
         {
-            out.push((t, rec));
+            return Ok(Some(x));
         }
     }
-    Ok(out)
-}
-
-/// Every write record of `key`, newest first.
-fn all_writes<F: Fs>(ov: &Overlay<F>, key: &[u8]) -> Result<Vec<(u64, WriteRecord)>> {
-    writes_below(ov, key, u64::MAX)
+    Ok(None)
 }
 
 /// The record our transaction left on `key`: its commit, or a rollback.
@@ -243,10 +293,18 @@ fn own_record<F: Fs>(
     key: &[u8],
     start_ts: u64,
 ) -> Result<Option<(u64, WriteRecord)>> {
-    Ok(all_writes(ov, key)?
-        .into_iter()
-        .take_while(|(t, _)| *t >= start_ts)
-        .find(|(_, r)| r.start_ts == start_ts))
+    // Stops at the first record older than the transaction: its commit
+    // or rollback record cannot be below its start.
+    Ok(find_write(ov, key, u64::MAX, |t, r| {
+        if t < start_ts {
+            Some(None)
+        } else if r.start_ts == start_ts {
+            Some(Some((t, r)))
+        } else {
+            None
+        }
+    })?
+    .flatten())
 }
 
 fn lock_info(key: &[u8], l: &Lock) -> LockInfo {
@@ -272,14 +330,12 @@ pub fn get<F: Fs>(
     {
         return Ok(Err(lock_info(key, &l)));
     }
-    for (_, rec) in writes_below(ov, key, ts)? {
-        match rec.kind {
-            WriteKind::Put(v) => return Ok(Ok(Some(v))),
-            WriteKind::Delete => return Ok(Ok(None)),
-            WriteKind::Rollback => continue,
-        }
-    }
-    Ok(Ok(None))
+    let found = find_write(ov, key, ts, |_, rec| match rec.kind {
+        WriteKind::Put(v) => Some(Some(v)),
+        WriteKind::Delete => Some(None),
+        WriteKind::Rollback => None,
+    })?;
+    Ok(Ok(found.flatten()))
 }
 
 /// Visible `(key, value)` pairs for user keys in `[start, end)` as of `ts`.
@@ -295,7 +351,8 @@ pub fn scan<F: Fs>(
     let mut out = Vec::new();
     let mut current: Option<Vec<u8>> = None;
     let mut decided = false;
-    for (k, v) in ov.scan(&lo, &hi)? {
+    for row in ov.iter(&lo, &hi) {
+        let (k, v) = row?;
         let Some((user, cf, t)) = keys::decode_data_key(&k) else {
             continue;
         };
@@ -357,19 +414,23 @@ pub fn prewrite<F: Fs>(
             Err(MvccError::Locked(lock_info(&p.key, &l)))
         });
     }
-    for (t, rec) in all_writes(ov, &p.key)? {
+    // `Some(r)`: answer `r` without locking. `None`: no conflict, lock.
+    let answer = find_write(ov, &p.key, u64::MAX, |t, rec| {
         if t < p.start_ts {
-            break;
-        }
-        if rec.start_ts == p.start_ts {
-            return Ok(match rec.kind {
+            Some(None)
+        } else if rec.start_ts == p.start_ts {
+            Some(Some(match rec.kind {
                 WriteKind::Rollback => Err(MvccError::Aborted),
                 _ => Ok(()), // already committed: a late retry
-            });
+            }))
+        } else if rec.kind != WriteKind::Rollback && fault != MvccFault::SkipWriteConflict {
+            Some(Some(Err(MvccError::WriteConflict)))
+        } else {
+            None
         }
-        if rec.kind != WriteKind::Rollback && fault != MvccFault::SkipWriteConflict {
-            return Ok(Err(MvccError::WriteConflict));
-        }
+    })?;
+    if let Some(Some(r)) = answer {
+        return Ok(r);
     }
     let lock = Lock {
         primary: p.primary,
@@ -498,15 +559,20 @@ pub fn validate_read<F: Fs>(
     {
         return Ok(Err(MvccError::Locked(lock_info(key, &l))));
     }
-    for (t, rec) in writes_below(ov, key, commit_ts)? {
+    let conflict = find_write(ov, key, commit_ts, |t, rec| {
         if t <= start_ts {
-            break;
+            Some(false)
+        } else if rec.kind != WriteKind::Rollback && rec.start_ts != start_ts {
+            Some(true)
+        } else {
+            None
         }
-        if rec.kind != WriteKind::Rollback && rec.start_ts != start_ts {
-            return Ok(Err(MvccError::WriteConflict));
-        }
-    }
-    Ok(Ok(()))
+    })?;
+    Ok(if conflict == Some(true) {
+        Err(MvccError::WriteConflict)
+    } else {
+        Ok(())
+    })
 }
 
 /// Serializable validation of a scanned span: no key in `[start, end)` may
@@ -521,7 +587,8 @@ pub fn validate_range<F: Fs>(
     commit_ts: u64,
 ) -> Result<std::result::Result<(), MvccError>> {
     let (lo, hi) = keys::data_span(start, end);
-    for (k, v) in ov.scan(&lo, &hi)? {
+    for row in ov.iter(&lo, &hi) {
+        let (k, v) = row?;
         let Some((user, cf, t)) = keys::decode_data_key(&k) else {
             continue;
         };

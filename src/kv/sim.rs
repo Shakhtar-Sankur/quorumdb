@@ -147,6 +147,10 @@ impl Sim {
                 level1_bytes: 4096 + rng.below(16384),
                 level_multiplier: 2 + rng.below(4),
                 bloom_bits_per_key: 10,
+                // Odd seeds read through a tiny, constantly evicting cache.
+                block_cache_bytes: if seed % 2 == 1 { 2048 } else { 0 },
+                bloom_prefix: (!seed.is_multiple_of(3))
+                    .then_some(crate::kv::keys::bloom_prefix_len as _),
                 fault: crate::storage::engine::Fault::None,
             },
             fault,

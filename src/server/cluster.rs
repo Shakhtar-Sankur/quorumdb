@@ -30,6 +30,9 @@ pub struct LocalCluster<F: Fs> {
     last_tick: u64,
     last_pd: u64,
     next_pd_req: ReqId,
+    /// A real clock, read throughout a step so latencies are measured
+    /// precisely (the server and benchmarks); virtual time if absent.
+    clock: Option<Box<dyn Fn() -> u64>>,
 }
 
 impl<F: Fs> LocalCluster<F> {
@@ -85,7 +88,13 @@ impl<F: Fs> LocalCluster<F> {
             last_tick: 0,
             last_pd: 0,
             next_pd_req: PD_REQ_BASE,
+            clock: None,
         })
+    }
+
+    /// Read time from `clock` (milliseconds) during every step.
+    pub fn set_clock(&mut self, clock: impl Fn() -> u64 + 'static) {
+        self.clock = Some(Box::new(clock));
     }
 
     pub fn now(&self) -> u64 {
@@ -113,6 +122,9 @@ impl<F: Fs> LocalCluster<F> {
         }
         for _ in 0..1_000 {
             let mut busy = false;
+            if let Some(c) = &self.clock {
+                self.now = self.now.max(c());
+            }
             self.io.set_now(self.now);
             busy |= self.exec.run_ready() > 0;
             for (id, node, range, req) in self.io.take_outbox() {
@@ -121,9 +133,7 @@ impl<F: Fs> LocalCluster<F> {
                     s.submit(range, id, req);
                 }
             }
-            let ids: Vec<NodeId> = self.stores.keys().copied().collect();
-            for id in ids {
-                let store = self.stores.get_mut(&id).expect("store");
+            for store in self.stores.values_mut() {
                 store.process()?;
                 for (to, m) in store.take_messages() {
                     self.network.push_back((to, m));

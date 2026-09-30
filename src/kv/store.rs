@@ -74,6 +74,7 @@ impl Default for StoreConfig {
             compact_after: 128,
             engine: Options {
                 sync: SyncMode::Manual,
+                bloom_prefix: Some(keys::bloom_prefix_len),
                 ..Options::default()
             },
             fault: StoreFault::None,
@@ -723,9 +724,13 @@ impl<F: Fs> Store<F> {
                 replica.persisted_last = last.index;
             }
         }
-        self.db.write_batch(ops)?;
-        if self.cfg.fault != StoreFault::SkipRaftSync {
-            self.db.sync()?;
+        // Nothing new to make durable (heartbeats, ReadIndex rounds): the
+        // messages promise only state an earlier round already synced.
+        if !ops.is_empty() {
+            self.db.write_batch(ops)?;
+            if self.cfg.fault != StoreFault::SkipRaftSync {
+                self.db.sync()?;
+            }
         }
 
         // 2. Now that it is durable, release the messages.

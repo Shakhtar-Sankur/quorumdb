@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::kv::client::{CallError, KvClient};
 use crate::kv::cmd::{KvError, Request, Response};
+use crate::runtime::join_all;
 use crate::txn::mvcc::{LockInfo, TxnStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,8 +91,10 @@ pub async fn timestamp(kv: &KvClient) -> Result<u64, TxnError> {
 }
 
 /// Learn the fate of the transaction that holds `lock`, and finish its
-/// lock on this key accordingly. Waits a little if it is still running.
-pub async fn resolve_lock(kv: &KvClient, lock: &LockInfo) -> Result<(), TxnError> {
+/// lock on this key accordingly. If it is still running, wait: 1 ms at
+/// first, doubling with each `attempt`, since most locks are released
+/// within a millisecond or two.
+pub async fn resolve_lock(kv: &KvClient, lock: &LockInfo, attempt: u32) -> Result<(), TxnError> {
     let status = kv
         .call(Request::CheckTxnStatus {
             primary: lock.primary.clone(),
@@ -102,7 +105,8 @@ pub async fn resolve_lock(kv: &KvClient, lock: &LockInfo) -> Result<(), TxnError
         Ok(Response::Status(TxnStatus::Committed(c))) => Some(c),
         Ok(Response::Status(TxnStatus::RolledBack)) => None,
         Ok(Response::Status(TxnStatus::Locked)) => {
-            kv.io.sleep(10 + kv.io.rand(40)).await;
+            let cap = 1u64 << attempt.min(6);
+            kv.io.sleep(cap / 2 + 1 + kv.io.rand(cap)).await;
             return Ok(());
         }
         Ok(r) => return Err(TxnError::Other(format!("unexpected {r:?}"))),
@@ -116,6 +120,18 @@ pub async fn resolve_lock(kv: &KvClient, lock: &LockInfo) -> Result<(), TxnError
     .await
     .map(|_| ())
     .map_err(other)
+}
+
+/// The most telling error among concurrent results: an abort, then a
+/// conflict, then anything else.
+fn pick_error(results: Vec<Result<(), TxnError>>) -> Option<TxnError> {
+    let mut errors: Vec<TxnError> = results.into_iter().filter_map(Result::err).collect();
+    errors.sort_by_key(|e| match e {
+        TxnError::Aborted => 0,
+        TxnError::Conflict(_) => 1,
+        _ => 2,
+    });
+    errors.into_iter().next()
 }
 
 pub struct Txn {
@@ -148,7 +164,7 @@ impl Txn {
         if let Some(v) = self.writes.get(key) {
             return Ok(v.clone());
         }
-        for _ in 0..50 {
+        for attempt in 0..50 {
             let req = Request::MvccGet {
                 key: key.to_vec(),
                 ts: self.start_ts,
@@ -158,7 +174,9 @@ impl Txn {
                     self.reads.insert(key.to_vec());
                     return Ok(v);
                 }
-                Err(CallError::Kv(KvError::Locked(l))) => resolve_lock(&self.kv, &l).await?,
+                Err(CallError::Kv(KvError::Locked(l))) => {
+                    resolve_lock(&self.kv, &l, attempt).await?
+                }
                 Ok(r) => return Err(TxnError::Other(format!("unexpected {r:?}"))),
                 Err(e) => return Err(other(e)),
             }
@@ -192,7 +210,9 @@ impl Txn {
                 };
                 match self.kv.call(req).await {
                     Ok(Response::Rows { rows, resume }) => break (rows, resume),
-                    Err(CallError::Kv(KvError::Locked(l))) => resolve_lock(&self.kv, &l).await?,
+                    Err(CallError::Kv(KvError::Locked(l))) => {
+                        resolve_lock(&self.kv, &l, attempts).await?
+                    }
                     Ok(r) => return Err(TxnError::Other(format!("unexpected {r:?}"))),
                     Err(e) => return Err(other(e)),
                 }
@@ -264,47 +284,19 @@ impl Txn {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        // Phase 1: lock every key, primary first.
-        for (key, value) in &writes {
-            let mut attempts = 0;
-            loop {
-                attempts += 1;
-                let req = Request::Prewrite {
-                    key: key.clone(),
-                    value: value.clone(),
-                    primary: primary.clone(),
-                    start_ts: self.start_ts,
-                    ttl: self.opts.lock_ttl,
-                };
-                match self.kv.call(req).await {
-                    Ok(_) => break,
-                    Err(CallError::Kv(KvError::Locked(l))) if attempts < 20 => {
-                        if let Err(e) = resolve_lock(&self.kv, &l).await {
-                            self.rollback().await;
-                            return Err(e);
-                        }
-                    }
-                    Err(CallError::Kv(KvError::Locked(_))) => {
-                        self.rollback().await;
-                        return Err(TxnError::Conflict("key stayed locked".into()));
-                    }
-                    Err(CallError::Kv(KvError::WriteConflict)) => {
-                        self.rollback().await;
-                        return Err(TxnError::Conflict(format!(
-                            "write conflict on {:?}",
-                            String::from_utf8_lossy(key)
-                        )));
-                    }
-                    Err(CallError::Kv(KvError::Aborted)) => {
-                        self.rollback().await;
-                        return Err(TxnError::Aborted);
-                    }
-                    Err(e) => {
-                        self.rollback().await;
-                        return Err(other(e));
-                    }
-                }
-            }
+        // Phase 1: lock every key, all at once. Parallel requests share
+        // Raft rounds and fsyncs (group commit), so this costs about one
+        // round trip however many keys are written.
+        let results = join_all(
+            writes
+                .iter()
+                .map(|(k, v)| self.prewrite(k, v, &primary))
+                .collect(),
+        )
+        .await;
+        if let Some(e) = pick_error(results) {
+            self.rollback().await;
+            return Err(e);
         }
 
         let commit_ts = match timestamp(&self.kv).await {
@@ -337,11 +329,10 @@ impl Txn {
                     commit_ts,
                 });
             }
-            for check in checks {
-                if let Err(e) = self.validate(check).await {
-                    self.rollback().await;
-                    return Err(e);
-                }
+            let results = join_all(checks.into_iter().map(|c| self.validate(c)).collect()).await;
+            if let Some(e) = pick_error(results) {
+                self.rollback().await;
+                return Err(e);
             }
         }
 
@@ -359,16 +350,53 @@ impl Txn {
             }
             Err(_) => return Err(TxnError::Unknown),
         }
-        for (key, _) in writes.iter().filter(|(k, _)| *k != primary) {
-            let req = Request::Commit {
-                key: key.clone(),
-                start_ts: self.start_ts,
-                commit_ts,
-            };
-            // Best effort: a reader finishes any secondary left locked.
-            let _ = self.kv.call(req).await;
-        }
+        // Best effort, in parallel: a reader finishes any secondary left locked.
+        let secondaries = writes
+            .iter()
+            .filter(|(k, _)| *k != primary)
+            .map(|(key, _)| {
+                self.kv.call(Request::Commit {
+                    key: key.clone(),
+                    start_ts: self.start_ts,
+                    commit_ts,
+                })
+            });
+        join_all(secondaries.collect()).await;
         Ok(commit_ts)
+    }
+
+    /// Lock one key for this transaction, resolving other transactions'
+    /// locks in the way.
+    async fn prewrite(
+        &self,
+        key: &[u8],
+        value: &Option<Vec<u8>>,
+        primary: &[u8],
+    ) -> Result<(), TxnError> {
+        for attempt in 0..20 {
+            let req = Request::Prewrite {
+                key: key.to_vec(),
+                value: value.clone(),
+                primary: primary.to_vec(),
+                start_ts: self.start_ts,
+                ttl: self.opts.lock_ttl,
+            };
+            match self.kv.call(req).await {
+                Ok(_) => return Ok(()),
+                Err(CallError::Kv(KvError::Locked(l))) => {
+                    resolve_lock(&self.kv, &l, attempt).await?
+                }
+                Err(CallError::Kv(KvError::WriteConflict)) => {
+                    return Err(TxnError::Conflict(format!(
+                        "write conflict on {:?}",
+                        String::from_utf8_lossy(key)
+                    )));
+                }
+                Err(CallError::Kv(KvError::Aborted)) => return Err(TxnError::Aborted),
+                Err(e) => return Err(other(e)),
+            }
+        }
+        Err(TxnError::Conflict("key stayed locked".into()))
     }
 
     /// Validate one key or span, following a span across ranges.
@@ -412,13 +440,17 @@ impl Txn {
     /// Undo any locks we placed. The primary first: its rollback record
     /// decides the transaction, even if a prewrite of it is still in flight.
     pub async fn rollback(&mut self) {
-        let keys: Vec<Vec<u8>> = self.writes.keys().cloned().collect();
-        for key in keys {
-            let req = Request::Rollback {
+        let mut keys = self.writes.keys().cloned();
+        let Some(primary) = keys.next() else {
+            return;
+        };
+        let rollback = |key| {
+            self.kv.call(Request::Rollback {
                 key,
                 start_ts: self.start_ts,
-            };
-            let _ = self.kv.call(req).await;
-        }
+            })
+        };
+        let _ = rollback(primary).await;
+        join_all(keys.map(rollback).collect()).await;
     }
 }

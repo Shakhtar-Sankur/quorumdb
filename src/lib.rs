@@ -5,6 +5,7 @@
 //!
 //! See the README for the architecture and the roadmap.
 
+pub mod bench;
 pub mod check;
 pub mod codec;
 pub mod crc;

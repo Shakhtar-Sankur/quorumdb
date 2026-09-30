@@ -714,38 +714,104 @@ async fn table(txn: &mut Txn, name: &str) -> R<TableDef> {
     }
 }
 
+fn decode_row(v: &[u8]) -> R<Vec<Value>> {
+    types::decode_row(v).ok_or_else(|| err("corrupt row"))
+}
+
+/// The key span a range or full scan covers.
+fn scan_span(t: &TableDef, access: &Access) -> (Vec<u8>, Vec<u8>) {
+    match access {
+        Access::Range(lo, hi) => (
+            lo.as_ref()
+                .map_or_else(|| t.prefix(), |(v, _)| t.row_key(v)),
+            hi.as_ref().map_or_else(
+                || t.prefix_end(),
+                |(v, inc)| {
+                    let mut k = t.row_key(v);
+                    if *inc {
+                        k.push(0xFF);
+                    }
+                    k
+                },
+            ),
+        ),
+        _ => (t.prefix(), t.prefix_end()),
+    }
+}
+
 async fn read_rows(txn: &mut Txn, t: &TableDef, access: &Access) -> R<Vec<Vec<Value>>> {
-    let decode = |v: &[u8]| types::decode_row(v).ok_or_else(|| err("corrupt row"));
     match access {
         Access::Get(pk) => match txn.get(&t.row_key(pk)).await.map_err(from_txn)? {
-            Some(v) => Ok(vec![decode(&v)?]),
+            Some(v) => Ok(vec![decode_row(&v)?]),
             None => Ok(Vec::new()),
         },
         Access::Full | Access::Range(..) => {
-            let (start, end) = match access {
-                Access::Range(lo, hi) => (
-                    lo.as_ref()
-                        .map_or_else(|| t.prefix(), |(v, _)| t.row_key(v)),
-                    hi.as_ref().map_or_else(
-                        || t.prefix_end(),
-                        |(v, inc)| {
-                            let mut k = t.row_key(v);
-                            if *inc {
-                                k.push(0xFF);
-                            }
-                            k
-                        },
-                    ),
-                ),
-                _ => (t.prefix(), t.prefix_end()),
-            };
+            let (start, end) = scan_span(t, access);
             let rows = txn
                 .scan(&start, &end, usize::MAX / 4)
                 .await
                 .map_err(from_txn)?;
-            rows.iter().map(|(_, v)| decode(v)).collect()
+            rows.iter().map(|(_, v)| decode_row(v)).collect()
         }
     }
+}
+
+/// Scan in primary key order only until `need` rows pass the filter. The
+/// transaction then records only the keys actually read, so a writer
+/// inserting past them does not conflict with this read.
+async fn read_rows_until(
+    txn: &mut Txn,
+    t: &TableDef,
+    access: &Access,
+    need: usize,
+    filter: Option<&Expr>,
+    scope: &Scope,
+) -> R<Vec<Vec<Value>>> {
+    let (mut cursor, end) = scan_span(t, access);
+    let mut out = Vec::new();
+    let mut matched = 0;
+    while matched < need {
+        let want = need - matched;
+        let batch = txn.scan(&cursor, &end, want).await.map_err(from_txn)?;
+        let exhausted = batch.len() < want;
+        for (k, v) in &batch {
+            let row = decode_row(v)?;
+            if filter.map_or(Ok(true), |f| eval(f, scope, &row).map(|x| truthy(&x)))? {
+                matched += 1;
+            }
+            out.push(row);
+            cursor = k.clone();
+            cursor.push(0);
+        }
+        if exhausted {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// How many rows a query can stop scanning after: set when it reads one
+/// table in primary key order with a LIMIT and nothing that needs every
+/// row (grouping, aggregates, another sort order).
+fn scan_limit(sel: &Select, t: &TableDef, alias: &str) -> Option<usize> {
+    let limit = sel.limit?;
+    let pk = &t.columns[t.pk].name;
+    let is_pk = |e: &Expr| matches!(e, Expr::Column(q, c) if c == pk && q.as_deref().is_none_or(|q| q == alias));
+    let plain = sel.joins.is_empty() && sel.group_by.is_empty() && sel.having.is_none();
+    let no_aggregates = sel.items.iter().all(|i| match i {
+        SelectItem::Wildcard => true,
+        // An output alias named like the key could shadow it in ORDER BY.
+        SelectItem::Expr(e, a) => {
+            !has_aggregate(e) && (a.as_deref() != Some(pk.as_str()) || is_pk(e))
+        }
+    });
+    let ordered = match sel.order_by.as_slice() {
+        [] => true,
+        [(e, false)] => is_pk(e),
+        _ => false,
+    };
+    (plain && no_aggregates && ordered)
+        .then(|| (limit + sel.offset.unwrap_or(0)).min(usize::MAX as u64 / 4) as usize)
 }
 
 async fn run(txn: &mut Txn, stmt: &Statement, rowid: &mut u64) -> R<QueryResult> {
@@ -1043,10 +1109,18 @@ async fn from_where(
     };
     plan.steps.push(describe_access(&t, &access));
     let mut scope = Scope::of(&t, &alias);
-    let mut rows = if dry {
-        Vec::new()
-    } else {
-        read_rows(txn, &t, &access).await?
+    let limit = match access {
+        Access::Get(_) => None,
+        _ => scan_limit(sel, &t, &alias),
+    };
+    if let Some(n) = limit {
+        plan.steps
+            .push(format!("Stop scanning after {n} matching rows"));
+    }
+    let mut rows = match limit {
+        _ if dry => Vec::new(),
+        Some(n) => read_rows_until(txn, &t, &access, n, sel.filter.as_ref(), &scope).await?,
+        None => read_rows(txn, &t, &access).await?,
     };
 
     for j in &sel.joins {

@@ -49,6 +49,7 @@ pub fn serve(cfg: ServerConfig) -> Result<(), String> {
     );
 
     let start = Instant::now();
+    cluster.set_clock(move || start.elapsed().as_millis() as u64);
     let mut conns: Vec<(TcpStream, Rc<RefCell<Conn>>)> = Vec::new();
     let mut buf = vec![0u8; 64 << 10];
     let mut next_pid = 1;

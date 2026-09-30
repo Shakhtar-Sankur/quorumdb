@@ -23,12 +23,14 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::storage::cache::BlockCache;
 use crate::storage::fs::Fs;
 use crate::storage::manifest::{self, Manifest};
 use crate::storage::merge::{MergeIter, Source};
-use crate::storage::sstable::{Table, TableBuilder};
+use crate::storage::sstable::{PrefixFn, Table, TableBuilder};
 use crate::storage::wal::{self, Op, Record};
 
 const MANIFEST: &str = "MANIFEST";
@@ -84,6 +86,11 @@ pub struct Options {
     pub level_multiplier: u64,
     /// Bloom filter bits per key. Ten gives about 1% false positives.
     pub bloom_bits_per_key: usize,
+    /// Bytes of decoded data blocks kept in memory (0: none).
+    pub block_cache_bytes: usize,
+    /// Add key prefixes to bloom filters too, for `range_in_prefix`. Must
+    /// stay the same function for the life of a database.
+    pub bloom_prefix: Option<PrefixFn>,
     #[doc(hidden)]
     pub fault: Fault,
 }
@@ -99,6 +106,8 @@ impl Default for Options {
             level1_bytes: 10 << 20,
             level_multiplier: 10,
             bloom_bits_per_key: 10,
+            block_cache_bytes: 32 << 20,
+            bloom_prefix: None,
             fault: Fault::None,
         }
     }
@@ -119,6 +128,8 @@ pub struct Stats {
     pub bloom_skips: u64,
     /// Data blocks read by point lookups.
     pub block_reads: u64,
+    /// Block reads (by lookups and scans) the block cache answered.
+    pub block_cache_hits: u64,
 }
 
 pub struct Db<F: Fs> {
@@ -138,11 +149,13 @@ pub struct Db<F: Fs> {
     stats: Stats,
     bloom_skips: Cell<u64>,
     block_reads: Cell<u64>,
+    cache: Arc<BlockCache>,
 }
 
 impl<F: Fs> Db<F> {
     /// Open the database in `fs`, creating it if empty and recovering it if not.
     pub fn open(fs: F, opts: Options) -> Result<Self> {
+        let cache = Arc::new(BlockCache::new(opts.block_cache_bytes));
         let mut db = Db {
             fs,
             opts,
@@ -156,6 +169,7 @@ impl<F: Fs> Db<F> {
             stats: Stats::default(),
             bloom_skips: Cell::new(0),
             block_reads: Cell::new(0),
+            cache,
         };
         match db.fs.read(MANIFEST)? {
             None => {
@@ -177,12 +191,14 @@ impl<F: Fs> Db<F> {
                             "manifest: table {id} at level {level}"
                         )));
                     }
-                    let table = Table::open(&db.fs, id, table_name(id)).map_err(|e| match e {
-                        Error::Io(e) if e.kind() == io::ErrorKind::NotFound => {
-                            Error::Corrupt(format!("manifest names missing table {id}"))
-                        }
-                        e => e,
-                    })?;
+                    let table = Table::open(&db.fs, id, table_name(id))
+                        .map_err(|e| match e {
+                            Error::Io(e) if e.kind() == io::ErrorKind::NotFound => {
+                                Error::Corrupt(format!("manifest names missing table {id}"))
+                            }
+                            e => e,
+                        })?
+                        .with_cache(db.cache.clone());
                     db.levels[level].push(table);
                 }
                 for level in &mut db.levels[1..] {
@@ -264,12 +280,43 @@ impl<F: Fs> Db<F> {
         start: &'a [u8],
         end: Option<&'a [u8]>,
     ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a {
+        self.range_filtered(start, end, None)
+    }
+
+    /// Like `range`, for a span whose keys all have bloom prefix `prefix`
+    /// (see `Options::bloom_prefix`): tables whose filter rules the prefix
+    /// out are never read.
+    pub fn range_in_prefix<'a>(
+        &'a self,
+        prefix: &'a [u8],
+        start: &'a [u8],
+        end: &'a [u8],
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a {
+        debug_assert!(start.starts_with(prefix));
+        self.range_filtered(start, Some(end), self.opts.bloom_prefix.map(|_| prefix))
+    }
+
+    fn range_filtered<'a>(
+        &'a self,
+        start: &'a [u8],
+        end: Option<&'a [u8]>,
+        prefix: Option<&'a [u8]>,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a {
         let mut sources: Vec<Source<'_>> = vec![Box::new(
             self.mem
                 .range::<[u8], _>((std::ops::Bound::Included(start), std::ops::Bound::Unbounded))
                 .map(|(k, v)| Ok((k.clone(), v.clone()))),
         )];
-        let wanted = move |t: &&Table| t.largest() >= start && end.is_none_or(|e| t.smallest() < e);
+        let in_prefix = move |t: &Table| {
+            let ok = prefix.is_none_or(|p| t.may_contain_prefix(p));
+            if !ok {
+                self.bloom_skips.set(self.bloom_skips.get() + 1);
+            }
+            ok
+        };
+        let wanted = move |t: &&Table| {
+            t.largest() >= start && end.is_none_or(|e| t.smallest() < e) && in_prefix(t)
+        };
         for table in self.levels[0].iter().rev().filter(wanted) {
             sources.push(Box::new(table.iter_from(&self.fs, start)));
         }
@@ -277,7 +324,8 @@ impl<F: Fs> Db<F> {
             let first = level.partition_point(|t| t.largest() < start);
             let tables = level[first..]
                 .iter()
-                .take_while(move |t| end.is_none_or(|e| t.smallest() < e));
+                .take_while(move |t| end.is_none_or(|e| t.smallest() < e))
+                .filter(move |t| in_prefix(t));
             sources.push(Box::new(
                 tables.flat_map(move |t| t.iter_from(&self.fs, start)),
             ));
@@ -309,7 +357,8 @@ impl<F: Fs> Db<F> {
         if self.mem.is_empty() {
             return self.sync();
         }
-        let mut builder = TableBuilder::new(self.opts.block_bytes, self.opts.bloom_bits_per_key);
+        let mut builder = TableBuilder::new(self.opts.block_bytes, self.opts.bloom_bits_per_key)
+            .with_prefix(self.opts.bloom_prefix);
         for (k, v) in &self.mem {
             builder.add(k, v.as_deref());
         }
@@ -360,6 +409,7 @@ impl<F: Fs> Db<F> {
         Stats {
             bloom_skips: self.bloom_skips.get(),
             block_reads: self.block_reads.get(),
+            block_cache_hits: self.cache.hits(),
             ..self.stats
         }
     }
@@ -482,6 +532,7 @@ impl<F: Fs> Db<F> {
                 }
                 let b = builder.get_or_insert_with(|| {
                     TableBuilder::new(self.opts.block_bytes, self.opts.bloom_bits_per_key)
+                        .with_prefix(self.opts.bloom_prefix)
                 });
                 b.add(&key, value.as_deref());
                 if b.estimated_size() >= self.opts.table_bytes {
@@ -536,7 +587,7 @@ impl<F: Fs> Db<F> {
         if self.opts.fault != Fault::NoSyncBeforeManifest {
             self.fs.sync(&name)?;
         }
-        Table::open(&self.fs, id, name)
+        Ok(Table::open(&self.fs, id, name)?.with_cache(self.cache.clone()))
     }
 
     fn write(&mut self, ops: Vec<Op>) -> Result<()> {
