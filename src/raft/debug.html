@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>quorumdb Raft timeline</title>
+<style>
+:root {
+  --bg: #fbfaf7; --panel: #ffffff; --ink: #1d1f24; --muted: #6b6f78; --line: #e4e1da;
+  --follower: #c9ccd3; --pre: #f3d08a; --cand: #e9a23b; --leader: #2f9e62; --down: #d8483f;
+  --part: #7a5cc7; --cursor: #1d1f24; --bad: #c53a31; --good: #2f9e62;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171b; --panel: #1d2026; --ink: #e8e9ec; --muted: #9aa0ab; --line: #2e323a;
+    --follower: #4a4f59; --pre: #9c7d3c; --cand: #d08c2c; --leader: #3fbf7a; --down: #e0574e;
+    --part: #9d83e6; --cursor: #e8e9ec; --bad: #ef6a60; --good: #3fbf7a;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171b; --panel: #1d2026; --ink: #e8e9ec; --muted: #9aa0ab; --line: #2e323a;
+  --follower: #4a4f59; --pre: #9c7d3c; --cand: #d08c2c; --leader: #3fbf7a; --down: #e0574e;
+  --part: #9d83e6; --cursor: #e8e9ec; --bad: #ef6a60; --good: #3fbf7a;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 40px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: var(--muted); margin: 0 0 14px; }
+.verdict { padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
+  margin-bottom: 14px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+  white-space: pre-wrap; word-break: break-word; }
+.verdict.bad { border-color: var(--bad); color: var(--bad); }
+.verdict.good { border-color: var(--good); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 14px; }
+canvas { display: block; width: 100%; cursor: crosshair; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 12px; margin-top: 8px; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+  margin-right: 5px; vertical-align: -1px; background: var(--c); }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.controls input[type=range] { flex: 1; min-width: 160px; }
+button { font: inherit; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--ink); cursor: pointer; }
+.pos { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--muted); min-width: 170px; }
+.grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; }
+@media (max-width: 800px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; }
+.role { display: inline-block; padding: 0 6px; border-radius: 4px; color: #111; }
+ol { list-style: none; margin: 0; padding: 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+li { padding: 5px 0; border-bottom: 1px solid var(--line); }
+li.cur { background: color-mix(in srgb, var(--leader) 14%, transparent); }
+li .ch { color: var(--muted); padding-left: 14px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+.hint { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Raft run, replayed</h1>
+  <p class="sub" id="sub"></p>
+  <div class="verdict" id="verdict"></div>
+  <div class="card">
+    <canvas id="tl" height="220" aria-label="Timeline of every node's role"></canvas>
+    <div class="legend">
+      <span style="--c: var(--follower)">follower</span>
+      <span style="--c: var(--pre)">pre-candidate</span>
+      <span style="--c: var(--cand)">candidate</span>
+      <span style="--c: var(--leader)">leader</span>
+      <span style="--c: var(--down)">down</span>
+      <span style="--c: var(--part)">partitioned</span>
+    </div>
+  </div>
+  <div class="card controls">
+    <button id="prev" title="Previous change (←)">◀</button>
+    <input type="range" id="slider" min="0" value="0" aria-label="Event">
+    <button id="next" title="Next change (→)">▶</button>
+    <span class="pos" id="pos"></span>
+  </div>
+  <div class="grid">
+    <div class="card"><h2>Cluster state</h2><div class="scroll"><table id="state"></table></div>
+      <p class="hint">Click the timeline or use ← →. Every row is exactly what the deterministic replay of this seed produced.</p></div>
+    <div class="card"><h2>What changed</h2><ol id="events"></ol></div>
+  </div>
+</main>
+<script>
+const D = /*DATA*/null;
+const ROLES = ["Follower", "PreCandidate", "Candidate", "Leader"];
+const ROLE_VARS = ["--follower", "--pre", "--cand", "--leader"];
+const F = D.frames;
+const ids = F[0].s.map(n => n[0]);
+document.getElementById("sub").textContent =
+  `seed ${D.seed}, fault ${D.fault}, ${D.ms} ms of chaos then healing; ${D.events} events handled over ${D.end} ms; ${F.length} of them changed something`;
+const v = document.getElementById("verdict");
+v.textContent = (D.ok ? "✓ " : "✗ ") + D.verdict;
+v.className = "verdict " + (D.ok ? "good" : "bad");
+
+const slider = document.getElementById("slider");
+slider.max = F.length - 1;
+let cur = F.length - 1;
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const canvas = document.getElementById("tl");
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, laneH = 22, top = 8, left = 34;
+  const h = top + ids.length * laneH + 26;
+  canvas.style.height = h + "px";
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const end = Math.max(1, D.end);
+  const x = t => left + (w - left - 6) * t / end;
+  g.font = "11px ui-monospace, Menlo, monospace";
+  ids.forEach((id, i) => {
+    const y = top + i * laneH;
+    g.fillStyle = css("--muted");
+    g.fillText("n" + id, 4, y + 14);
+    for (let k = 0; k < F.length; k++) {
+      const n = F[k].s[i], t0 = F[k].t, t1 = k + 1 < F.length ? F[k + 1].t : D.end;
+      g.fillStyle = css(n[1] ? ROLE_VARS[n[3]] : "--down");
+      g.fillRect(x(t0), y + 3, Math.max(1, x(t1) - x(t0)), laneH - 8);
+      if (n[1] && n[2] === 1) {
+        g.fillStyle = css("--part");
+        g.fillRect(x(t0), y + laneH - 5, Math.max(1, x(t1) - x(t0)), 2);
+      }
+    }
+  });
+  // Time axis.
+  g.fillStyle = css("--muted");
+  const axisY = top + ids.length * laneH + 16;
+  for (let t = 0; t <= end; t += end > 20000 ? 5000 : 1000) {
+    g.fillRect(x(t), axisY - 12, 1, 4);
+    g.fillText((t / 1000) + "s", x(t) - 6, axisY);
+  }
+  if (D.ms < end) {
+    g.fillStyle = css("--good");
+    g.fillRect(x(D.ms), top, 1, ids.length * laneH);
+  }
+  if (!D.ok) {
+    g.fillStyle = css("--bad");
+    g.fillRect(x(D.end) - 2, top, 2, ids.length * laneH);
+  }
+  g.fillStyle = css("--cursor");
+  g.fillRect(x(F[cur].t) - 0.5, 0, 1.5, top + ids.length * laneH);
+}
+
+function show() {
+  slider.value = cur;
+  const f = F[cur];
+  document.getElementById("pos").textContent = `event #${f.n}  t=${f.t} ms`;
+  const rows = f.s.map(n => {
+    const role = n[1] ? ROLES[n[3]] : "down";
+    const color = css(n[1] ? ROLE_VARS[n[3]] : "--down");
+    return `<tr><td>n${n[0]}${n[9] ? " (spare)" : ""}</td><td><span class="role" style="background:${color}">${role}</span></td>` +
+      `<td>${n[4]}</td><td>${n[5]}</td><td>${n[7]}</td><td>${n[6]}/${n[10]}</td><td>${n[8] ? "n" + n[8] : "-"}</td>` +
+      `<td>${n[1] && n[2] ? "side " + n[2] : ""}</td></tr>`;
+  }).join("");
+  document.getElementById("state").innerHTML =
+    "<tr><th>node</th><th>role</th><th>term</th><th>commit</th><th>applied</th><th>last/term</th><th>leader</th><th></th></tr>" + rows;
+  const from = Math.max(0, cur - 10), to = Math.min(F.length, cur + 5);
+  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  document.getElementById("events").innerHTML = F.slice(from, to).map((e, i) =>
+    `<li class="${from + i === cur ? "cur" : ""}" data-k="${from + i}">#${e.n} t=${e.t} ${esc(e.e)}` +
+    e.c.map(c => `<div class="ch">* ${esc(c)}</div>`).join("") + "</li>").join("");
+  draw();
+}
+slider.oninput = () => { cur = +slider.value; show(); };
+document.getElementById("prev").onclick = () => { cur = Math.max(0, cur - 1); show(); };
+document.getElementById("next").onclick = () => { cur = Math.min(F.length - 1, cur + 1); show(); };
+document.getElementById("events").onclick = e => {
+  const li = e.target.closest("li"); if (li) { cur = +li.dataset.k; show(); }
+};
+document.addEventListener("keydown", e => {
+  const step = e.shiftKey ? 10 : 1;
+  if (e.key === "ArrowLeft") { cur = Math.max(0, cur - step); show(); }
+  if (e.key === "ArrowRight") { cur = Math.min(F.length - 1, cur + step); show(); }
+});
+canvas.onclick = e => {
+  const r = canvas.getBoundingClientRect(), left = 34;
+  const t = (e.clientX - r.left - left) / (r.width - left - 6) * D.end;
+  let best = 0;
+  for (let k = 0; k < F.length; k++) if (F[k].t <= t) best = k;
+  cur = best; show();
+};
+window.addEventListener("resize", draw);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", show);
+show();
+</script>
+</body>
+</html>

@@ -140,6 +140,100 @@ pub struct Sim {
     next_read: u64,
     report: Report,
     compact_every: u64,
+    phase: Phase,
+}
+
+/// Where a run is: faults and workload until `until`, then healed and
+/// waiting for the cluster to converge by `end`.
+#[derive(Clone, Copy)]
+enum Phase {
+    Chaos { until: u64 },
+    Settling { end: u64, next_check: u64 },
+    Done,
+}
+
+/// A log entry as the debugger shows it: index, term, and what it holds.
+pub type LogLine = (u64, u64, String);
+
+/// A node as the debugger shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeView {
+    pub id: NodeId,
+    pub up: bool,
+    /// Its side of the current partition (0 when healed).
+    pub group: u8,
+    pub role: String,
+    pub term: u64,
+    pub vote: Option<NodeId>,
+    pub leader: Option<NodeId>,
+    pub voters: Vec<NodeId>,
+    pub first_index: u64,
+    pub last_index: u64,
+    /// The term of the last log entry: what elections compare.
+    pub last_term: u64,
+    pub commit: u64,
+    pub applied: u64,
+}
+
+fn describe_msg(m: &super::Msg) -> String {
+    use super::Msg;
+    match m {
+        Msg::Vote {
+            pre,
+            force,
+            last_index,
+            last_term,
+        } => format!(
+            "{}vote request{}, log at {last_index}/{last_term}",
+            if *pre { "pre-" } else { "" },
+            if *force {
+                " (forced by a transfer)"
+            } else {
+                ""
+            }
+        ),
+        Msg::VoteResp { pre, granted } => format!(
+            "{}vote {}",
+            if *pre { "pre-" } else { "" },
+            if *granted { "granted" } else { "rejected" }
+        ),
+        Msg::Append {
+            prev_index,
+            prev_term,
+            entries,
+            commit,
+            ..
+        } if entries.is_empty() => {
+            format!("heartbeat after {prev_index}/{prev_term}, commit {commit}")
+        }
+        Msg::Append {
+            prev_index,
+            prev_term,
+            entries,
+            commit,
+            ..
+        } => format!(
+            "append {} entries after {prev_index}/{prev_term}, commit {commit}",
+            entries.len()
+        ),
+        Msg::AppendResp { success, index, .. } => {
+            if *success {
+                format!("append ok, matches up to {index}")
+            } else {
+                format!("append rejected, hint {index}")
+            }
+        }
+        Msg::Snapshot(s) => format!("snapshot up to {}/{}", s.meta.index, s.meta.term),
+        other => format!("{other:?}"),
+    }
+}
+
+/// The outcome of one `Sim::step`.
+pub enum Step {
+    /// An event was handled; what it was.
+    Event(String),
+    /// The run is over: its report, or the first violation found.
+    Finished(Result<Report, String>),
 }
 
 impl Sim {
@@ -183,6 +277,7 @@ impl Sim {
                 ..Report::default()
             },
             compact_every: 5 + rng.below(40),
+            phase: Phase::Chaos { until: 0 },
             cfg,
             rng,
         };
@@ -253,6 +348,17 @@ impl Sim {
     /// Run for `duration` ms of simulated time with faults, then heal
     /// everything and check that the cluster converges.
     pub fn run(mut self, duration: u64) -> Result<Report, String> {
+        self.begin(duration);
+        loop {
+            if let Step::Finished(result) = self.step() {
+                return result;
+            }
+        }
+    }
+
+    /// Schedule the fault and workload generators for a run of `duration`
+    /// ms. Then call `step` until it reports `Finished`.
+    pub fn begin(&mut self, duration: u64) {
         let faults = [
             (Event::ClientWrite, 3),
             (Event::ClientRead, 7),
@@ -265,53 +371,163 @@ impl Sim {
             let d = self.rng.below(every) + 1;
             self.schedule(d, e);
         }
-        // Peek, never pop-and-discard: a dropped Tick would stop a node's
-        // clock forever.
-        while let Some(&Reverse((t, _, i))) = self.queue.peek() {
-            if t > duration {
-                break;
+        self.phase = Phase::Chaos { until: duration };
+    }
+
+    /// Advance by one event: the unit of a debugger step. Deterministic,
+    /// so replaying a seed for `n` steps always reaches the same state.
+    pub fn step(&mut self) -> Step {
+        match self.phase {
+            Phase::Chaos { until } => {
+                // Peek, never pop-and-discard: a dropped Tick would stop a
+                // node's clock forever.
+                match self.queue.peek() {
+                    Some(&Reverse((t, _, i))) if t <= until => {
+                        self.queue.pop();
+                        self.now = t;
+                        let event = self.events[i].take().expect("event");
+                        let what = self.describe(&event);
+                        match self.handle(event, true) {
+                            Ok(()) => Step::Event(what),
+                            Err(e) => self.finish(Err(e)),
+                        }
+                    }
+                    _ => {
+                        // Heal: everything up, fully connected, no loss.
+                        self.drop_percent = 0;
+                        for g in self.group.values_mut() {
+                            *g = 0;
+                        }
+                        let down: Vec<NodeId> = self
+                            .nodes
+                            .iter()
+                            .filter(|(_, n)| !n.up)
+                            .map(|(&id, _)| id)
+                            .collect();
+                        for id in down {
+                            if let Err(e) = self.restart(id) {
+                                return self.finish(Err(e));
+                            }
+                        }
+                        // Liveness: within 20 simulated seconds of healing, a
+                        // leader must emerge and every voter must converge.
+                        self.phase = Phase::Settling {
+                            end: self.now + 20_000,
+                            next_check: self.now + 500,
+                        };
+                        Step::Event("faults stop: every node restarted, the network healed".into())
+                    }
+                }
             }
-            self.queue.pop();
-            self.now = t;
-            let event = self.events[i].take().expect("event");
-            self.handle(event, true)?;
+            Phase::Settling {
+                end,
+                mut next_check,
+            } => loop {
+                let Some(&Reverse((t, _, i))) = self.queue.peek() else {
+                    let r = self.check_converged();
+                    return self.finish(r);
+                };
+                if t > next_check {
+                    if self.check_converged().is_ok() {
+                        return self.finish(Ok(()));
+                    }
+                    next_check += 500;
+                    self.phase = Phase::Settling { end, next_check };
+                    if next_check > end {
+                        let r = self.check_converged();
+                        return self.finish(r);
+                    }
+                    continue;
+                }
+                self.queue.pop();
+                self.now = t;
+                let event = self.events[i].take().expect("event");
+                let what = self.describe(&event);
+                return match self.handle(event, false) {
+                    Ok(()) => Step::Event(what),
+                    Err(e) => self.finish(Err(e)),
+                };
+            },
+            Phase::Done => Step::Finished(Err("the run is over".into())),
         }
-        // Heal: everything up, fully connected, no loss; let it settle.
-        self.drop_percent = 0;
-        for g in self.group.values_mut() {
-            *g = 0;
+    }
+
+    fn finish(&mut self, result: Result<(), String>) -> Step {
+        self.phase = Phase::Done;
+        Step::Finished(result.map(|()| self.report.clone()))
+    }
+
+    /// One line on what an event is, for the debugger's trace.
+    fn describe(&self, event: &Event) -> String {
+        match event {
+            Event::Deliver(m) => format!(
+                "deliver n{} -> n{} (term {}): {}",
+                m.from,
+                m.to,
+                m.term,
+                describe_msg(&m.msg)
+            ),
+            Event::Tick(id) => format!("tick n{id}"),
+            Event::Crash => "crash a random node".into(),
+            Event::Restart(id) => format!("restart n{id}"),
+            Event::Partition => "partition the network at random".into(),
+            Event::Heal => "heal the partition".into(),
+            Event::ClientWrite => "client write to the leader".into(),
+            Event::ClientRead => "client linearizable read".into(),
+            Event::Membership => "membership change".into(),
+            Event::Transfer => "leadership transfer".into(),
         }
-        let down: Vec<NodeId> = self
-            .nodes
+    }
+
+    /// Simulated time, in milliseconds.
+    pub fn now(&self) -> u64 {
+        self.now
+    }
+
+    /// Events waiting in the queue: messages in flight, timers, faults.
+    pub fn pending_events(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Every node's state, for the debugger.
+    pub fn nodes(&self) -> Vec<NodeView> {
+        self.nodes
             .iter()
-            .filter(|(_, n)| !n.up)
-            .map(|(&id, _)| id)
+            .map(|(&id, n)| NodeView {
+                id,
+                up: n.up,
+                group: self.group[&id],
+                role: format!("{:?}", n.raft.role()),
+                term: n.raft.term(),
+                vote: n.disk.hard.vote,
+                leader: n.raft.leader(),
+                voters: n.raft.voters().to_vec(),
+                first_index: n.raft.first_index(),
+                last_index: n.raft.last_index(),
+                last_term: n.raft.entry_term(n.raft.last_index()).unwrap_or(0),
+                commit: n.raft.commit_index(),
+                applied: n.disk.applied,
+            })
+            .collect()
+    }
+
+    /// A node's durable log, `(index, term, what)`, and its snapshot index.
+    pub fn log(&self, id: NodeId) -> Option<(u64, Vec<LogLine>)> {
+        let n = self.nodes.get(&id)?;
+        let entries = n
+            .disk
+            .entries
+            .iter()
+            .map(|e| {
+                let what = match &e.data {
+                    EntryData::Command(c) => String::from_utf8_lossy(c).into_owned(),
+                    EntryData::Empty => "(empty: new leader)".into(),
+                    EntryData::Config(v) => format!("(config: voters {v:?})"),
+                };
+                (e.index, e.term, what)
+            })
             .collect();
-        for id in down {
-            self.restart(id)?;
-        }
-        // Liveness: within 20 simulated seconds of healing, a leader must
-        // emerge and every voter must converge on the same state.
-        let end = self.now + 20_000;
-        let mut next_check = self.now + 500;
-        while let Some(&Reverse((t, _, i))) = self.queue.peek() {
-            if t > next_check {
-                if self.check_converged().is_ok() {
-                    return Ok(self.report);
-                }
-                next_check += 500;
-                if next_check > end {
-                    break;
-                }
-                continue;
-            }
-            self.queue.pop();
-            self.now = t;
-            let event = self.events[i].take().expect("event");
-            self.handle(event, false)?;
-        }
-        self.check_converged()?;
-        Ok(self.report)
+        Some((n.disk.snap.index, entries))
     }
 
     fn handle(&mut self, event: Event, faults: bool) -> Result<(), String> {

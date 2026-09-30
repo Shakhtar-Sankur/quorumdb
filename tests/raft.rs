@@ -49,3 +49,46 @@ fn every_planted_raft_bug_is_caught() {
         }
     }
 }
+
+/// Stepping back is replaying: travelling to an event from either
+/// direction must reach exactly the same cluster state.
+#[test]
+fn debugger_time_travel_is_exact() {
+    use quorumdb::raft::debug::Debugger;
+    let mut d = Debugger::new(3, RaftFault::None, 3_000);
+    d.goto(1_500);
+    let (at, nodes) = (d.now(), d.nodes().to_vec());
+    d.goto(4_000);
+    assert_ne!(d.nodes(), &nodes[..], "nothing happened in 2,500 events");
+    d.goto(1_500);
+    assert_eq!((d.now(), d.nodes()), (at, &nodes[..]));
+    let out = d.exec("back 500");
+    assert!(out.starts_with("back at #1000"), "{out}");
+}
+
+/// Run to a planted bug's violation in the debugger, then rewind to the
+/// election that caused it: the violation is the one `raft-sim` reports,
+/// and the debugger stops on it.
+#[test]
+fn debugger_stops_at_a_planted_bug_and_breakpoints() {
+    use quorumdb::raft::debug::Debugger;
+    let fault = RaftFault::CommitOldTerm;
+    let (seed, msg) = (1100..3000)
+        .find_map(|seed| sim::run(seed, 10_000, fault).err().map(|m| (seed, m)))
+        .expect("the planted bug is caught");
+    let mut d = Debugger::new(seed, fault, 10_000);
+    let out = d.exec("continue");
+    assert!(
+        out.contains(&format!("VIOLATION after #{}: {msg}", d.position())),
+        "{out}"
+    );
+    let end = d.position();
+    // Breakpoints stop before the end: rewind, then stop at each election.
+    d.goto(0);
+    d.exec("break leader");
+    let out = d.exec("continue");
+    assert!(out.contains("-> Leader"), "{out}");
+    assert!(d.position() < end && d.outcome().is_none());
+    let html = quorumdb::raft::debug::html(seed, fault, 10_000);
+    assert!(html.contains("state machine safety") && !html.contains("/*DATA*/"));
+}

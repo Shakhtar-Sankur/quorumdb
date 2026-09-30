@@ -8,6 +8,10 @@ use quorumdb::{Db, Options, RealFs, SyncMode, sim};
 
 const USAGE: &str = "\
 usage:
+  quorumdb tpcc <empty dir> [--warehouses N] [--terminals N] [--seconds N]
+                                             TPC-C-derived benchmark on a 3-node cluster
+  quorumdb debug --seed N [--fault NAME] [--ms N] [--html FILE]
+                                             time-travel debugger for one Raft simulation
   quorumdb server <dir> [--nodes N] [--listen ADDR]
                                              run a SQL server (Postgres protocol) on an N-node cluster
   quorumdb shell <dir>                       interactive shell on a real directory
@@ -39,6 +43,8 @@ fn main() -> ExitCode {
         Some("kv-sim") => kv_simulate(&args[1..]),
         Some("txn-sim") => txn_simulate(&args[1..]),
         Some("server") if args.len() >= 2 => server(&args[1], &args[2..]),
+        Some("debug") => debug(&args[1..]),
+        Some("tpcc") if args.len() >= 2 => tpcc(&args[1], &args[2..]),
         Some("bench") if args.len() >= 2 => bench(&args[1], &args[2..]),
         _ => Err(USAGE.to_string()),
     };
@@ -361,8 +367,63 @@ fn bench(dir: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn raft_fault(name: &str) -> Result<quorumdb::raft::RaftFault, String> {
+    use quorumdb::raft::RaftFault;
+    Ok(match name {
+        "none" => RaftFault::None,
+        "vote-ignores-log" => RaftFault::VoteIgnoresLog,
+        "commit-old-term" => RaftFault::CommitOldTerm,
+        "skip-prev-check" => RaftFault::SkipPrevCheck,
+        "read-without-quorum" => RaftFault::ReadWithoutQuorum,
+        other => return Err(format!("unknown fault: {other}\n{USAGE}")),
+    })
+}
+
+/// The time-travel debugger: an interactive session on one seed of the
+/// Raft simulator, or (`--html`) the whole run as a timeline page.
+fn debug(args: &[String]) -> Result<(), String> {
+    use quorumdb::raft::debug::{self, Debugger};
+    let (mut seed, mut ms, mut fault_name, mut html) = (0u64, 10_000u64, "none".to_string(), None);
+    parse_flags(args, |flag, value| {
+        match flag {
+            "--seed" => seed = num(flag, value)?,
+            "--ms" => ms = num(flag, value)?,
+            "--fault" => fault_name = value.to_string(),
+            "--html" => html = Some(value.to_string()),
+            other => return Err(format!("unknown flag: {other}\n{USAGE}")),
+        }
+        Ok(())
+    })?;
+    let fault = raft_fault(&fault_name)?;
+    if let Some(path) = html {
+        std::fs::write(&path, debug::html(seed, fault, ms)).map_err(|e| format!("{path}: {e}"))?;
+        println!("wrote {path}");
+        return Ok(());
+    }
+    let mut d = Debugger::new(seed, fault, ms);
+    println!(
+        "quorumdb time-travel debugger: Raft simulator, seed {seed}, fault {fault_name}. Type help."
+    );
+    print!("{}", d.exec("state"));
+    let stdin = io::stdin();
+    loop {
+        print!("(qdb) ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        if stdin.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+            println!();
+            return Ok(());
+        }
+        let line = line.trim();
+        if line == "quit" || line == "q" || line == "exit" {
+            return Ok(());
+        }
+        print!("{}", d.exec(line));
+    }
+}
+
 fn raft_simulate(args: &[String]) -> Result<(), String> {
-    use quorumdb::raft::{RaftFault, sim as rsim};
+    use quorumdb::raft::sim as rsim;
     let (mut seeds, mut ms, mut from, mut fault_name) =
         (100u64, 10_000u64, 0u64, "none".to_string());
     parse_flags(args, |flag, value| {
@@ -375,14 +436,7 @@ fn raft_simulate(args: &[String]) -> Result<(), String> {
         }
         Ok(())
     })?;
-    let fault = match fault_name.as_str() {
-        "none" => RaftFault::None,
-        "vote-ignores-log" => RaftFault::VoteIgnoresLog,
-        "commit-old-term" => RaftFault::CommitOldTerm,
-        "skip-prev-check" => RaftFault::SkipPrevCheck,
-        "read-without-quorum" => RaftFault::ReadWithoutQuorum,
-        other => return Err(format!("unknown fault: {other}\n{USAGE}")),
-    };
+    let fault = raft_fault(&fault_name)?;
     let start = Instant::now();
     let mut t = rsim::Report::default();
     for seed in from..from + seeds {
@@ -401,7 +455,8 @@ fn raft_simulate(args: &[String]) -> Result<(), String> {
             }
             Err(msg) => {
                 return Err(format!(
-                    "FAILED {msg}\nreplay: quorumdb raft-sim --from {seed} --seeds 1 --ms {ms} --fault {fault_name}"
+                    "FAILED {msg}\nreplay: quorumdb raft-sim --from {seed} --seeds 1 --ms {ms} --fault {fault_name}\n\
+                     debug:  quorumdb debug --seed {seed} --ms {ms} --fault {fault_name}"
                 ));
             }
         }
@@ -567,4 +622,151 @@ fn server(dir: &str, args: &[String]) -> Result<(), String> {
         nodes,
         addr,
     })
+}
+
+fn tpcc(dir: &str, args: &[String]) -> Result<(), String> {
+    use quorumdb::bench::tpcc::{self, KINDS, Stats};
+    use quorumdb::kv::client::KvClient;
+    use quorumdb::kv::store::StoreConfig;
+    use quorumdb::server::cluster::LocalCluster;
+    use quorumdb::sql::exec::Session;
+    use quorumdb::txn::client::TxnOptions;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let (mut warehouses, mut terminals, mut seconds) = (0u64, 10u64, 60u64);
+    parse_flags(args, |flag, value| {
+        match flag {
+            "--warehouses" => warehouses = num(flag, value)?,
+            "--terminals" => terminals = num(flag, value)?.max(1),
+            "--seconds" => seconds = num(flag, value)?.max(1),
+            other => return Err(format!("unknown flag: {other}\n{USAGE}")),
+        }
+        Ok(())
+    })?;
+    if std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_some()) {
+        return Err(format!("{dir} is not empty; tpcc needs a fresh directory"));
+    }
+    // TPC-C: ten terminals per warehouse, each bound to one district.
+    if warehouses == 0 {
+        warehouses = terminals.div_ceil(tpcc::DISTRICTS);
+    }
+    let err = |e: quorumdb::Error| e.to_string();
+    let fs = (1..=3)
+        .map(|n| RealFs::open(format!("{dir}/node{n}")))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    let mut cluster = LocalCluster::open(fs, StoreConfig::default(), 2_000).map_err(err)?;
+    let clock = Instant::now();
+    let ms = move || clock.elapsed().as_millis() as u64;
+    cluster.set_clock(ms);
+    let run = |cluster: &mut LocalCluster<RealFs>, done: &dyn Fn() -> bool| -> Result<(), String> {
+        while !done() {
+            if !cluster.step(ms()).map_err(err)? {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        Ok(())
+    };
+    let io0 = cluster.io.clone();
+    let session = move || Session::new(KvClient::new(io0.clone()), TxnOptions::default());
+
+    println!(
+        "TPC-C (derived): {warehouses} warehouse(s), {terminals} terminals, {seconds}s, 3 nodes, serializable"
+    );
+    let loaded: Rc<RefCell<Option<Result<(), String>>>> = Rc::new(RefCell::new(None));
+    {
+        let (loaded, sessions) = (loaded.clone(), (0..16).map(|_| session()).collect());
+        cluster.exec.spawn(async move {
+            let r = tpcc::load(sessions, warehouses)
+                .await
+                .map_err(|e| e.message());
+            *loaded.borrow_mut() = Some(r);
+        });
+    }
+    let t0 = ms();
+    run(&mut cluster, &|| loaded.borrow().is_some())?;
+    loaded.borrow_mut().take().expect("done")?;
+    println!("loaded in {:.1}s", (ms() - t0) as f64 / 1000.0);
+
+    let stats: Vec<Rc<RefCell<Stats>>> = (0..terminals)
+        .map(|_| Rc::new(RefCell::new(Stats::default())))
+        .collect();
+    let start = ms();
+    let until = start + seconds * 1000;
+    let finished = Rc::new(RefCell::new(0u64));
+    for (i, st) in stats.iter().enumerate() {
+        let io = cluster.io.clone();
+        let (st, finished, s) = (st.clone(), finished.clone(), session());
+        cluster.exec.spawn(async move {
+            // Round-robin over warehouses, then over their districts.
+            let home = tpcc::Home {
+                w: 1 + i as u64 % warehouses,
+                d: 1 + (i as u64 / warehouses) % tpcc::DISTRICTS,
+                warehouses,
+            };
+            tpcc::terminal(s, io, until, home, 1000 + i as u64, st).await;
+            *finished.borrow_mut() += 1;
+        });
+    }
+    run(&mut cluster, &|| *finished.borrow() == terminals)?;
+    let elapsed = (ms() - start) as f64 / 1000.0;
+
+    let mut total = Stats::default();
+    for st in &stats {
+        total.merge(&st.borrow());
+    }
+    let new_orders = total.latencies[0].len() as f64;
+    println!(
+        "\n  tpmC {:.0}   ({} New-Orders committed in {:.1}s)",
+        new_orders * 60.0 / elapsed,
+        new_orders,
+        elapsed
+    );
+    println!(
+        "  {:<13} {:>8} {:>9} {:>9} {:>9}",
+        "transaction", "commits", "p50 ms", "p99 ms", "retries"
+    );
+    for kind in KINDS {
+        let mut l = total.latencies[kind as usize].clone();
+        l.sort_unstable();
+        let pct = |p: f64| {
+            l.get(((l.len() as f64 * p) as usize).min(l.len().saturating_sub(1)))
+                .copied()
+                .unwrap_or(0)
+        };
+        println!(
+            "  {:<13} {:>8} {:>9} {:>9} {:>9}",
+            format!("{kind:?}"),
+            l.len(),
+            pct(0.5),
+            pct(0.99),
+            total.retries[kind as usize]
+        );
+    }
+    println!(
+        "  {} serialization conflicts retried, {} gave up after 30 tries, {} intentional rollbacks (1% of New-Orders), {} errors",
+        total.retries.iter().sum::<u64>(),
+        total.gave_up,
+        total.rollbacks,
+        total.errors
+    );
+
+    type Checked = Option<Result<Vec<String>, String>>;
+    let checked: Rc<RefCell<Checked>> = Rc::new(RefCell::new(None));
+    {
+        let (checked, mut s) = (checked.clone(), session());
+        cluster.exec.spawn(async move {
+            let r = tpcc::check_consistency(&mut s, warehouses)
+                .await
+                .map_err(|e| e.message());
+            *checked.borrow_mut() = Some(r);
+        });
+    }
+    run(&mut cluster, &|| checked.borrow().is_some())?;
+    match checked.borrow_mut().take().expect("done")? {
+        p if p.is_empty() => println!("  consistency conditions 1 and 2: hold"),
+        p => return Err(format!("consistency violated:\n  {}", p.join("\n  "))),
+    }
+    Ok(())
 }

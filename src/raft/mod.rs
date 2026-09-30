@@ -20,6 +20,7 @@
 //!   time, and only after the leader has committed an entry in its term.
 //! - **Leadership transfer** via `TimeoutNow`.
 
+pub mod debug;
 pub mod sim;
 
 use std::collections::{BTreeMap, BTreeSet};
